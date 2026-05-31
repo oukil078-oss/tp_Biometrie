@@ -17,31 +17,44 @@ const MAX_RETRIES = 3
 /* ------------------------------------------------------------------ */
 
 interface CameraPreviewProps {
-  streamRef: React.MutableRefObject<MediaStream | null>
   isActive: boolean
-  onStatusChange: (status: 'idle' | 'camera' | 'detecting' | 'verifying' | 'success' | 'error') => void
-  onFaceDetected: (detected: boolean, score: number) => void
   modelsReadyRef: React.MutableRefObject<boolean>
-  onVerifyFace: (embedding: number[], confidence: number) => Promise<void>
+  onStatusChange: (status: 'camera' | 'detecting' | 'verifying' | 'error') => void
+  onFaceDetected: (detected: boolean, score: number) => void
+  onVerifyFace: (embedding: number[], score: number) => Promise<void>
 }
 
-function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, modelsReadyRef, onVerifyFace }: CameraPreviewProps) {
+function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetected, onVerifyFace }: CameraPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
   const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [streamActive, setStreamActive] = useState(false)
   const verifyingRef = useRef(false)
+  const startingRef = useRef(false)
 
   /* ---- start camera ---- */
   const startCamera = useCallback(async () => {
-    if (!modelsReadyRef.current) { setError('Models not loaded yet.'); return }
+    if (startingRef.current) return
+    startingRef.current = true
+
+    if (!modelsReadyRef.current) {
+      setError('Face detection models not loaded yet.')
+      startingRef.current = false
+      onStatusChange('error')
+      return
+    }
+
+    console.log('[Verify CameraPreview] Starting camera...')
     setError('')
     setLoading(true)
+    setStreamActive(false)
     verifyingRef.current = false
 
     // stop any existing stream first
     if (streamRef.current) {
+      console.log('[Verify CameraPreview] Stopping existing stream')
       streamRef.current.getTracks().forEach(t => t.stop())
       streamRef.current = null
     }
@@ -52,62 +65,123 @@ function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, mo
         audio: false,
       })
       streamRef.current = stream
+      console.log('[Verify CameraPreview] Got stream:', stream.id)
 
       const video = videoRef.current
-      if (!video) { setError('Video element not available.'); setLoading(false); return }
+      if (!video) {
+        setError('Video element not available in DOM.')
+        setLoading(false)
+        startingRef.current = false
+        onStatusChange('error')
+        return
+      }
 
-      video.srcObject = stream
+      // Explicitly set attributes for mobile/Safari compatibility
+      video.setAttribute('autoplay', 'true')
+      video.setAttribute('playsinline', 'true')
+      video.setAttribute('muted', 'true')
       video.autoplay = true
       video.playsInline = true
       video.muted = true
 
+      // Assign stream to video
+      video.srcObject = stream
+      console.log('[Verify CameraPreview] srcObject assigned')
+
       // Wait for metadata then play
       if (video.readyState < 1) {
         await new Promise<void>((resolve, reject) => {
-          const onLoaded = () => { video.removeEventListener('loadedmetadata', onLoaded); resolve() }
-          const onError = () => { video.removeEventListener('error', onError); reject(new Error('video error')) }
+          const onLoaded = () => {
+            video.removeEventListener('loadedmetadata', onLoaded)
+            resolve()
+          }
+          const onErr = () => {
+            video.removeEventListener('error', onErr)
+            reject(new Error('video element error'))
+          }
           video.addEventListener('loadedmetadata', onLoaded)
-          video.addEventListener('error', onError)
+          video.addEventListener('error', onErr)
           setTimeout(() => reject(new Error('loadedmetadata timeout')), 8000)
         })
       }
 
+      console.log('[Verify CameraPreview] readyState:', video.readyState)
       await video.play()
+      console.log('[Verify CameraPreview] video.play() succeeded')
       setStreamActive(true)
       setLoading(false)
+      startingRef.current = false
       onStatusChange('camera')
     } catch (err: unknown) {
+      console.error('[Verify CameraPreview] Camera error:', err)
       setLoading(false)
       setStreamActive(false)
+      startingRef.current = false
       const e = err as Error
-      if (e.name === 'NotAllowedError') setError('Camera permission denied. Please allow camera access in your browser settings.')
-      else if (e.name === 'NotFoundError') setError('No camera found on this device.')
-      else if (e.name === 'NotReadableError') setError('Camera is in use by another application.')
-      else setError(`Failed to open camera: ${e.message || 'Unknown error'}`)
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
+
+      if (e.name === 'NotAllowedError')
+        setError('Camera permission denied. Please allow camera access in your browser settings.')
+      else if (e.name === 'NotFoundError')
+        setError('No camera found on this device.')
+      else if (e.name === 'NotReadableError')
+        setError('Camera is in use by another application.')
+      else if (e.name === 'SecurityError')
+        setError('Camera access blocked. Make sure you are on a secure (HTTPS) connection or localhost.')
+      else
+        setError(`Failed to open camera: ${e.message || 'Unknown error'}`)
+
       onStatusChange('error')
     }
-  }, [modelsReadyRef, onStatusChange, streamRef])
+  }, [modelsReadyRef, onStatusChange])
 
   /* ---- stop camera ---- */
   const stopCamera = useCallback(() => {
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
-    if (detectionRef.current) { clearInterval(detectionRef.current); detectionRef.current = null }
+    console.log('[Verify CameraPreview] Stopping camera')
+    if (detectionRef.current) {
+      clearInterval(detectionRef.current)
+      detectionRef.current = null
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
     const video = videoRef.current
-    if (video) { video.srcObject = null }
+    if (video) {
+      video.srcObject = null
+    }
     setStreamActive(false)
+    setLoading(false)
     onFaceDetected(false, 0)
     verifyingRef.current = false
-  }, [onFaceDetected, streamRef])
+    startingRef.current = false
+  }, [onFaceDetected])
 
   /* ---- face detection loop ---- */
   useEffect(() => {
-    if (!isActive || !streamActive) return
+    if (!isActive || !streamActive) {
+      if (detectionRef.current) {
+        clearInterval(detectionRef.current)
+        detectionRef.current = null
+      }
+      return
+    }
+
     const video = videoRef.current
-    if (!video || video.readyState < 4) return
+    if (!video || video.readyState < 4) {
+      console.warn('[Verify CameraPreview] Video not ready for detection')
+      return
+    }
+
     if (verifyingRef.current) return
 
-    onStatusChange('detecting')
+    console.log('[Verify CameraPreview] Starting face detection loop')
     onFaceDetected(false, 0)
+    onStatusChange('detecting')
 
     detectionRef.current = setInterval(async () => {
       if (!video || video.readyState !== 4 || verifyingRef.current) return
@@ -117,31 +191,36 @@ function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, mo
           onFaceDetected(true, det.score)
           if (det.score > 0.5 && !verifyingRef.current) {
             verifyingRef.current = true
-            onStatusChange('verifying')
+            console.log('[Verify CameraPreview] Face detected! Starting verification...')
             clearInterval(detectionRef.current!)
             detectionRef.current = null
-            // capture frame for verification
+            onStatusChange('verifying')
+
+            // Capture frame for verification
             const canvas = document.createElement('canvas')
             canvas.width = video.videoWidth
             canvas.height = video.videoHeight
             const ctx = canvas.getContext('2d')
             if (ctx) {
+              // Flip horizontally to match mirrored preview
+              ctx.translate(canvas.width, 0)
+              ctx.scale(-1, 1)
               ctx.drawImage(video, 0, 0)
               try {
                 const imgDet = await faceapi.detectSingleFace(canvas).withFaceLandmarks().withFaceDescriptor()
                 if (imgDet) {
                   await onVerifyFace(Array.from(imgDet.descriptor), det.score)
                 } else {
-                  setError('No face features extracted.')
-                  onStatusChange('error')
+                  setError('Could not extract face features. Please try again.')
                   verifyingRef.current = false
+                  onStatusChange('error')
                   stopCamera()
                 }
               } catch (verifyErr) {
-                console.error('Verification error:', verifyErr)
-                setError('Verification failed.')
-                onStatusChange('error')
+                console.error('[Verify CameraPreview] Verification error:', verifyErr)
+                setError('Verification processing failed.')
                 verifyingRef.current = false
+                onStatusChange('error')
                 stopCamera()
               }
             }
@@ -149,23 +228,45 @@ function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, mo
         } else {
           onFaceDetected(false, 0)
         }
-      } catch { /* ignore individual detection errors */ }
+      } catch (e) {
+        console.warn('[Verify CameraPreview] Detection error:', e)
+      }
     }, 300)
 
     return () => {
-      if (detectionRef.current) { clearInterval(detectionRef.current); detectionRef.current = null }
+      if (detectionRef.current) {
+        clearInterval(detectionRef.current)
+        detectionRef.current = null
+      }
     }
   }, [isActive, streamActive, onStatusChange, onFaceDetected, onVerifyFace, stopCamera])
 
-  /* Start camera when isActive becomes true */
+  /* ---- auto-start camera when isActive becomes true ---- */
   useEffect(() => {
-    if (isActive && !loading && !streamActive && !error) {
+    if (isActive && !streamActive && !loading && !error && !startingRef.current) {
+      console.log('[Verify CameraPreview] isActive=true, auto-starting camera')
       startCamera()
     }
-  }, [isActive, loading, streamActive, error, startCamera])
+  }, [isActive])
 
-  /* cleanup on unmount */
-  useEffect(() => { return () => { if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null } } }, [streamRef])
+  /* ---- cleanup ONLY on unmount ---- */
+  useEffect(() => {
+    return () => {
+      console.log('[Verify CameraPreview] Unmounting - cleaning up')
+      if (detectionRef.current) {
+        clearInterval(detectionRef.current)
+        detectionRef.current = null
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
+      const video = videoRef.current
+      if (video) {
+        video.srcObject = null
+      }
+    }
+  }, [])
 
   return (
     <div className="relative rounded-2xl overflow-hidden bg-secondary aspect-video mb-6">
@@ -175,12 +276,15 @@ function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, mo
         playsInline
         muted
         className="w-full h-full object-cover"
-        style={{ display: isActive && streamActive ? 'block' : 'none' }}
+        style={{
+          display: streamActive ? 'block' : 'none',
+          transform: 'scaleX(-1)', // mirror effect for selfie camera
+        }}
       />
 
       {/* Loading skeleton */}
       {loading && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm">
           <Loader2 className="w-10 h-10 text-primary animate-spin" />
           <span className="text-sm text-muted-foreground">Initializing camera...</span>
         </div>
@@ -188,7 +292,7 @@ function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, mo
 
       {/* Error state */}
       {error && !loading && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm">
           <AlertCircle className="w-10 h-10 text-red-400" />
           <span className="text-sm text-red-400 text-center px-6">{error}</span>
         </div>
@@ -196,27 +300,27 @@ function CameraPreview({ streamRef, isActive, onStatusChange, onFaceDetected, mo
 
       {/* Idle state */}
       {!isActive && !loading && !error && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary">
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm">
           <Camera className="w-12 h-12 text-muted-foreground" />
           <span className="text-sm text-muted-foreground">Camera is off</span>
         </div>
       )}
 
       {/* Active badge */}
-      {isActive && streamActive && !loading && (
-        <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium">
+      {streamActive && !loading && !error && (
+        <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium z-10">
           <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
           Camera active
         </div>
       )}
 
       {/* Face detection overlay */}
-      {isActive && streamActive && !loading && (
+      {isActive && streamActive && !loading && !error && (
         <>
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-60 border-2 rounded-full transition-all border-primary/30 animate-pulse" />
           <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
             <div className={`px-3 py-1.5 rounded-full text-xs font-medium ${
-              streamActive ? 'bg-primary/20 text-primary border border-primary/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
+              verifyingRef.current ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-primary/20 text-primary border border-primary/30'
             }`}>
               {verifyingRef.current ? 'Verifying...' : 'Looking for face...'}
             </div>
@@ -249,13 +353,17 @@ export default function VerifyPage() {
   useEffect(() => {
     const load = async () => {
       try {
+        console.log('[Verify] Loading face-api models from', MODEL_URL)
         await Promise.all([
           faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
         ])
         modelsReady.current = true
-      } catch { setError('Failed to load models.') }
+        console.log('[Verify] Models loaded successfully')
+      } catch {
+        setError('Failed to load face detection models.')
+      }
     }
     load()
     return () => { if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null } }
@@ -278,11 +386,14 @@ export default function VerifyPage() {
     setMessage('Start verification to compare your face.')
     setFaceDetected(false)
     setConfidence(0)
+    setRetries(0)
+    setError('')
   }, [])
 
   /* Verification callback - passed to CameraPreview */
-  const handleVerifyFace = useCallback(async (embedding: number[], detectedConfidence: number) => {
+  const handleVerifyFace = useCallback(async (embedding: number[], _detectedConfidence: number) => {
     try {
+      console.log('[Verify] Sending face data to server...')
       setStatus('verifying')
       setMessage('Comparing face with enrolled profile...')
 
@@ -294,32 +405,35 @@ export default function VerifyPage() {
       const data = await res.json()
 
       if (data.success) {
+        console.log('[Verify] Verification successful!')
         setStatus('success')
         setMessage('Face verified successfully!')
-        stopCamera()
+        if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
         fetch('/api/audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, eventType: 'biometric_success', details: 'Face verification successful' }) })
         setTimeout(() => router.push('/dashboard'), 2000)
       } else {
+        console.warn('[Verify] Verification failed:', data.message)
         const nr = retries + 1
         setRetries(nr)
         if (nr >= MAX_RETRIES) {
           setError(`Max retries (${MAX_RETRIES}) reached. Use password fallback.`)
           setStatus('error')
           setShowPasswordFallback(true)
-          stopCamera()
+          if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
         } else {
           setError(`Verification failed (${nr}/${MAX_RETRIES}). Try again.`)
           setStatus('idle')
           setMessage('Start verification to compare your face.')
-          stopCamera()
+          if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
         }
       }
     } catch {
-      setError('Verification failed.')
+      console.error('[Verify] Verification request error')
+      setError('Verification request failed.')
       setStatus('error')
-      stopCamera()
+      if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
     }
-  }, [retries, router, stopCamera])
+  }, [retries, router])
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center px-4 py-12">
@@ -351,13 +465,15 @@ export default function VerifyPage() {
             <p className="text-muted-foreground">{message}</p>
           </div>
 
-          {/* Messages */}
+          {/* Error message */}
           {error && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20 mb-6">
               <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
               <p className="text-sm text-red-400">{error}</p>
             </div>
           )}
+
+          {/* Success message */}
           {status === 'success' && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 mb-6">
               <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -374,24 +490,27 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Camera Preview - ALWAYS mounted, but stream starts on demand */}
-          {(status === 'camera' || status === 'detecting' || status === 'verifying' || status === 'idle' || status === 'error') && (
-            <CameraPreview
-              streamRef={streamRef}
-              isActive={status === 'camera' || status === 'detecting' || status === 'verifying'}
-              onStatusChange={(newStatus) => {
-                if (newStatus === 'verifying') {
-                  setStatus('verifying')
-                  setMessage('Verifying your face...')
-                } else {
-                  setStatus(newStatus)
-                }
-              }}
-              onFaceDetected={(detected, score) => { setFaceDetected(detected); setConfidence(score) }}
-              modelsReadyRef={modelsReady}
-              onVerifyFace={handleVerifyFace}
-            />
-          )}
+          {/* Camera Preview - ALWAYS mounted */}
+          <CameraPreview
+            isActive={status === 'camera' || status === 'detecting' || status === 'verifying'}
+            onStatusChange={(newStatus) => {
+              if (newStatus === 'camera') {
+                setStatus('camera')
+                setMessage('Position your face in the frame.')
+              } else if (newStatus === 'detecting') {
+                setStatus('detecting')
+                setMessage('Looking for your face...')
+              } else if (newStatus === 'verifying') {
+                setStatus('verifying')
+                setMessage('Verifying your face...')
+              } else if (newStatus === 'error') {
+                // Don't override error status - it's already set by CameraPreview
+              }
+            }}
+            onFaceDetected={(detected, score) => { setFaceDetected(detected); setConfidence(score) }}
+            modelsReadyRef={modelsReady}
+            onVerifyFace={handleVerifyFace}
+          />
 
           {/* Retries info */}
           {status === 'error' && retries < MAX_RETRIES && (
@@ -430,7 +549,7 @@ export default function VerifyPage() {
             <div className="flex gap-3">
               {status === 'idle' && (
                 <button
-                  onClick={() => setStatus('camera')}
+                  onClick={() => { setError(''); setStatus('camera'); setMessage('Opening camera...') }}
                   className="w-full btn-primary"
                 >
                   <Camera className="w-5 h-5 mr-2" /> Start Verification
@@ -441,7 +560,7 @@ export default function VerifyPage() {
               )}
               {status === 'error' && !showPasswordFallback && retries < MAX_RETRIES && (
                 <button
-                  onClick={() => { setError(''); setStatus('idle'); setRetries(prev => prev) }}
+                  onClick={() => { setError(''); setRetries(0); setStatus('idle'); setMessage('Start verification to compare your face.') }}
                   className="w-full btn-primary"
                 >
                   <Camera className="w-5 h-5 mr-2" /> Try Again
