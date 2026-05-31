@@ -17,11 +17,12 @@ export async function POST(req: NextRequest) {
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
     const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
 
-    const profileRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents?queries=["equal('user_id','${userId}')"]`, {
+    const profileUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?queries=["equal(\'user_id\',\'' + userId + '\")]'
+    const profileRes = await fetch(profileUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const profileData = await profileRes.json()
-    if (!profileData.documents?.length) return NextResponse.json({ success: false, message: 'No face profile found.', hasProfile: false }, { status: 404 })
+    if (!profileData.documents || profileData.documents.length === 0) return NextResponse.json({ success: false, message: 'No face profile found.', hasProfile: false }, { status: 404 })
 
     const profile = profileData.documents[0]
     const storedEmbedding = JSON.parse(profile.face_embedding)
@@ -31,7 +32,8 @@ export async function POST(req: NextRequest) {
 
     const logAudit = async (eventType: string, details: string) => {
       try {
-        await fetch(`${ep}/databases/${dbid}/collections/${acid}/docs`, {
+        const auditUrl = ep + '/databases/' + dbid + '/collections/' + acid + '/documents'
+        await fetch(auditUrl, {
           method: 'POST',
           headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -43,16 +45,17 @@ export async function POST(req: NextRequest) {
     }
 
     if (isMatch) {
-      await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents/${profile.$id}`, {
+      const updUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents/' + profile.$id
+      await fetch(updUrl, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: { last_verification: new Date().toISOString() } }),
       })
-      await logAudit('biometric_verification_success', `Face verified (euclidean: ${similarity.toFixed(4)})`)
+      await logAudit('biometric_verification_success', 'Face verified (euclidean: ' + similarity.toFixed(4) + ')')
       return NextResponse.json({ success: true, message: 'Face verified successfully!', similarity: 1 - similarity }, { status: 200 })
     }
 
-    await logAudit('biometric_verification_failed', `Face verification failed (euclidean: ${similarity.toFixed(4)})`)
+    await logAudit('biometric_verification_failed', 'Face verification failed (euclidean: ' + similarity.toFixed(4) + ')')
     return NextResponse.json({ success: false, message: 'Face verification failed.', similarity: 1 - similarity }, { status: 401 })
   } catch (e) {
     console.error('Verification error:', e)
@@ -62,8 +65,8 @@ export async function POST(req: NextRequest) {
 
 export async function GET(req: NextRequest) {
   try {
-    const { searchParams } = new URL(req.url)
-    const userId = searchParams.get('userId')
+    const url = new URL(req.url)
+    const userId = url.searchParams.get('userId')
     if (!userId) return NextResponse.json({ success: false, message: 'User ID required.' }, { status: 400 })
 
     const ep = process.env.APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1'
@@ -72,11 +75,12 @@ export async function GET(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
 
-    const res = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents?queries=["equal('user_id','${userId}')"]`, {
+    const profileUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?queries=["equal(\'user_id\',\'' + userId + '\")]'
+    const res = await fetch(profileUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const data = await res.json()
-    const hasProfile = data.documents?.length > 0
+    const hasProfile = data.documents && data.documents.length > 0
     return NextResponse.json({ success: true, hasProfile, profile: hasProfile ? data.documents[0] : null }, { status: 200 })
   } catch (e) {
     console.error('Profile check error:', e)

@@ -9,13 +9,19 @@ export async function POST(req: NextRequest) {
       const pid = process.env.APPWRITE_PROJECT_ID || ''
       const ak = process.env.APPWRITE_API_KEY || ''
       const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
-      await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_USERS_COLLECTION_ID || 'users'}/documents/${userId}`, {
+      const cid = process.env.APPWRITE_USERS_COLLECTION_ID || 'users'
+
+      const updUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents/' + userId
+      await fetch(updUrl, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: { last_login: '' } }),
       })
+
       try {
-        await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'}/docs`, {
+        const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
+        const auditUrl = ep + '/databases/' + dbid + '/collections/' + acid + '/documents'
+        await fetch(auditUrl, {
           method: 'POST',
           headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
           body: JSON.stringify({ documentId: 'unique()', data: { user_id: userId, event_type: 'logout', details: 'User logged out', timestamp: new Date().toISOString(), ip_address: req.headers.get('x-forwarded-for') || 'unknown', user_agent: req.headers.get('user-agent') || 'unknown' } }),

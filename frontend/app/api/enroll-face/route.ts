@@ -15,14 +15,16 @@ export async function POST(req: NextRequest) {
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
 
     // Check existing profile
-    const existingRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents?queries=["equal('user_id','${userId}')"]`, {
+    const checkUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?queries=["equal(\'user_id\',\'' + userId + '\")]'
+    const existingRes = await fetch(checkUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const existing = await existingRes.json()
 
-    if (existing.documents?.length > 0) {
+    if (existing.documents && existing.documents.length > 0) {
       const profileId = existing.documents[0].$id
-      const upd = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents/${profileId}`, {
+      const updUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents/' + profileId
+      const upd = await fetch(updUrl, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -32,7 +34,9 @@ export async function POST(req: NextRequest) {
       if (upd.ok) return NextResponse.json({ success: true, message: 'Face re-enrollment successful!', profileId }, { status: 200 })
     }
 
-    const createRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/docs`, {
+    // Create new profile
+    const createUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents'
+    const createRes = await fetch(createUrl, {
       method: 'POST',
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -45,12 +49,14 @@ export async function POST(req: NextRequest) {
     if (profileData.$id) {
       // Log audit
       try {
-        await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'}/docs`, {
+        const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
+        const auditUrl = ep + '/databases/' + dbid + '/collections/' + acid + '/documents'
+        await fetch(auditUrl, {
           method: 'POST',
           headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
           body: JSON.stringify({
             documentId: 'unique()',
-            data: { user_id: userId, event_type: 'biometric_enrollment', details: `Face enrolled for ${username}`, timestamp: new Date().toISOString(), ip_address: req.headers.get('x-forwarded-for') || 'unknown', user_agent: req.headers.get('user-agent') || 'unknown' }
+            data: { user_id: userId, event_type: 'biometric_enrollment', details: 'Face enrolled for ' + username, timestamp: new Date().toISOString(), ip_address: req.headers.get('x-forwarded-for') || 'unknown', user_agent: req.headers.get('user-agent') || 'unknown' }
           }),
         })
       } catch {}

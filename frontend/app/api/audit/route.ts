@@ -12,7 +12,8 @@ export async function POST(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
 
-    await fetch(`${ep}/databases/${dbid}/collections/${acid}/docs`, {
+    const auditUrl = ep + '/databases/' + dbid + '/collections/' + acid + '/documents'
+    await fetch(auditUrl, {
       method: 'POST',
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
       body: JSON.stringify({

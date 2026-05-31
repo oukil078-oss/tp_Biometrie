@@ -27,11 +27,13 @@ export async function POST(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const cid = process.env.APPWRITE_USERS_COLLECTION_ID || 'users'
 
-    const res = await fetch(`${ep}/databases/${dbid}/collections/${cid}/documents?queries=["equal('username','${username}')"]`, {
+    // Fetch user using string concatenation (no template literals in fetch URL)
+    const searchUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents?queries=["equal(\'username\',\'' + username + '\")]'
+    const res = await fetch(searchUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const data = await res.json()
-    const user = data.documents?.[0]
+    const user = data.documents && data.documents[0] ? data.documents[0] : null
 
     if (!user) {
       RATE_LIMIT_MAP.set(key, { count: (limit?.count || 0) + 1, resetTime: now + ((limit?.count || 0) >= 2 ? 15000 : (limit?.count || 0) >= 1 ? 10000 : 5000) })
@@ -44,7 +46,8 @@ export async function POST(req: NextRequest) {
     }
 
     // Update last login
-    await fetch(`${ep}/databases/${dbid}/collections/${cid}/documents/${user.$id}`, {
+    const updateUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents/' + user.$id
+    await fetch(updateUrl, {
       method: 'PATCH',
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: { last_login: new Date().toISOString() } }),
@@ -52,13 +55,15 @@ export async function POST(req: NextRequest) {
 
     RATE_LIMIT_MAP.delete(key)
 
-    // Check biometric
-    const bres = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'}/documents?queries=["equal('user_id','${user.$id}')"]`, {
+    // Check biometric enrollment
+    const bioUrl = ep + '/databases/' + dbid + '/collections/' + (process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles') + '/documents?queries=["equal(\'user_id\',\'' + user.$id + '\")]'
+    const bioRes = await fetch(bioUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
-    const bdata = await bres.json()
+    const bioData = await bioRes.json()
+    const hasBiometric = bioData.documents && bioData.documents.length > 0
 
-    return NextResponse.json({ success: true, message: 'Login successful!', userId: user.$id, username: user.username, hasBiometric: bdata.documents?.length > 0 }, { status: 200 })
+    return NextResponse.json({ success: true, message: 'Login successful!', userId: user.$id, username: user.username, hasBiometric }, { status: 200 })
   } catch (e) {
     console.error('Signin error:', e)
     return NextResponse.json({ success: false, message: 'Unexpected error.' }, { status: 500 })

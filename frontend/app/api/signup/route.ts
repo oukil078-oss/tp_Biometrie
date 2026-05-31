@@ -38,19 +38,21 @@ export async function POST(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const cid = process.env.APPWRITE_USERS_COLLECTION_ID || 'users'
 
-    // Check existing
-    const checkRes = await fetch(`${ep}/databases/${dbid}/collections/${cid}/docs`, {
+    // Check existing users using queries param
+    const checkUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents?queries=["equal(\'username\',\'' + username + '\")]'
+    const checkRes = await fetch(checkUrl, {
       method: 'GET',
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak },
     })
     const checkData = await checkRes.json()
-    if (checkData.documents?.find((u: any) => u.username === username))
+    if (checkData.documents && checkData.documents.length > 0)
       return NextResponse.json({ success: false, message: 'Username already exists.' }, { status: 409 })
 
     const salt = generateSalt()
     const hash = hashPassword(password, salt)
 
-    const createRes = await fetch(`${ep}/databases/${dbid}/collections/${cid}/docs`, {
+    const createUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents'
+    const createRes = await fetch(createUrl, {
       method: 'POST',
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -66,7 +68,7 @@ export async function POST(req: NextRequest) {
     }
 
     RATE_LIMIT_MAP.set(key, { count: (limit?.count || 0) + 1, resetTime: now + ((limit?.count || 0) >= 2 ? 15000 : (limit?.count || 0) >= 1 ? 10000 : 5000) })
-    return NextResponse.json({ success: false, message: 'Signup failed.' }, { status: 500 })
+    return NextResponse.json({ success: false, message: 'Signup failed. Please try again.' }, { status: 500 })
   } catch (e) {
     console.error('Signup error:', e)
     return NextResponse.json({ success: false, message: 'Unexpected error.' }, { status: 500 })
