@@ -1,9 +1,5 @@
 {
   "buildCommand": "cd frontend && npm run build",
   "outputDirectory": "frontend/.next",
-  "framework": "nextjs",
-  "env": {
-    "NEXT_PUBLIC_APPWRITE_ENDPOINT": "https://cloud.appwrite.io/v1",
-    "NEXT_PUBLIC_APPWRITE_PROJECT_ID": "6a1c1298003a00ab38a0"
-  }
+  "framework": "nextjs"
 }
