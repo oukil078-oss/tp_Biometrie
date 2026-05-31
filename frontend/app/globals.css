@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 224 71% 4%;
+    --foreground: 213 31% 91%;
+    --card: 224 71% 4%;
+    --card-foreground: 213 31% 91%;
+    --primary: 240 91% 65%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 215 20% 65%;
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 217 33% 17%;
+    --accent-foreground: 215 20% 65%;
+    --destructive: 0 63% 31%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 17%;
+    --input: 217 33% 17%;
+    --ring: 240 91% 65%;
+    --radius: 0.75rem;
+  }
+  .light {
+    --background: 0 0% 100%;
+    --foreground: 224 71% 4%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 71% 4%;
+    --primary: 240 91% 65%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 220 9% 46%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 220 14% 96%;
+    --accent-foreground: 220 9% 46%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 240 91% 65%;
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground antialiased; font-feature-settings: "rlig" 1, "calt" 1; }
+  html { scroll-behavior: smooth; }
+}
+
+@layer components {
+  .glass { @apply bg-white/5 backdrop-blur-xl border border-white/10; }
+  .input-field { @apply w-full px-4 py-3 rounded-xl bg-secondary border border-border text-foreground placeholder-muted-foreground transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50; }
+  .btn-primary { @apply inline-flex items-center justify-center px-6 py-3 rounded-xl font-medium bg-primary text-primary-foreground shadow-glow-sm transition-all duration-200 hover:bg-primary/90 hover:shadow-glow focus:outline-none focus:ring-2 focus:ring-primary/50 focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50 disabled:pointer-events-none; }
+  .btn-secondary { @apply inline-flex items-center justify-center px-6 py-3 rounded-xl font-medium bg-secondary text-secondary-foreground border border-border transition-all duration-200 hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring/50 disabled:opacity-50 disabled:pointer-events-none; }
+  .btn-ghost { @apply inline-flex items-center justify-center px-4 py-2 rounded-lg font-medium text-muted-foreground transition-all duration-200 hover:bg-secondary hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring/50; }
+  .badge { @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium; }
+  .badge-success { @apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20; }
+  .badge-warning { @apply bg-amber-500/10 text-amber-400 border border-amber-500/20; }
+  .badge-danger { @apply bg-red-500/10 text-red-400 border border-red-500/20; }
+  .badge-info { @apply bg-blue-500/10 text-blue-400 border border-blue-500/20; }
+}
+
+@layer utilities {
+  .text-gradient { @apply bg-gradient-to-r from-primary via-purple-400 to-cyan-400 bg-clip-text text-transparent; }
+  .bg-grid { background-image: linear-gradient(to right, rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.03) 1px, transparent 1px); background-size: 40px 40px; }
+  .bg-radial { background: radial-gradient(ellipse at center, rgba(99,102,241,0.15) 0%, transparent 70%); }
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: hsl(var(--background)); }
+::-webkit-scrollbar-thumb { background: hsl(var(--muted)); border-radius: 4px; }
+.card-hover { transition: all 0.2s ease; }
+.card-hover:hover { transform: translateY(-2px); box-shadow: 0 10px 40px -10px rgba(0,0,0,0.5); }
