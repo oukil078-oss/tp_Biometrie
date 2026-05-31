@@ -14,16 +14,17 @@ export async function POST(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
 
-    // Check existing profile
-    const checkUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?queries=["equal(\'user_id\',\'' + userId + '\")]'
-    const existingRes = await fetch(checkUrl, {
+    // List all biometric profiles and find by user_id
+    const listUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?limit=10000'
+    const listRes = await fetch(listUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
-    const existing = await existingRes.json()
+    const listData = await listRes.json()
+    const profiles = listData.documents || []
+    const existing = profiles.find((p: any) => p.user_id === userId)
 
-    if (existing.documents && existing.documents.length > 0) {
-      const profileId = existing.documents[0].$id
-      const updUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents/' + profileId
+    if (existing) {
+      const updUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents/' + existing.$id
       const upd = await fetch(updUrl, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
@@ -31,7 +32,7 @@ export async function POST(req: NextRequest) {
           data: { face_embedding: JSON.stringify(embedding), enrollment_date: new Date().toISOString(), last_verification: new Date().toISOString(), status: 'active' }
         }),
       })
-      if (upd.ok) return NextResponse.json({ success: true, message: 'Face re-enrollment successful!', profileId }, { status: 200 })
+      if (upd.ok) return NextResponse.json({ success: true, message: 'Face re-enrollment successful!', profileId: existing.$id }, { status: 200 })
     }
 
     // Create new profile
@@ -47,7 +48,6 @@ export async function POST(req: NextRequest) {
     const profileData = await createRes.json()
 
     if (profileData.$id) {
-      // Log audit
       try {
         const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
         const auditUrl = ep + '/databases/' + dbid + '/collections/' + acid + '/documents'

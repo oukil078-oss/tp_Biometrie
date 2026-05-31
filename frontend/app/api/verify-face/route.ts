@@ -17,14 +17,17 @@ export async function POST(req: NextRequest) {
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
     const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
 
-    const profileUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?queries=["equal(\'user_id\',\'' + userId + '\")]'
-    const profileRes = await fetch(profileUrl, {
+    // List all biometric profiles
+    const listUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?limit=10000'
+    const listRes = await fetch(listUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
-    const profileData = await profileRes.json()
-    if (!profileData.documents || profileData.documents.length === 0) return NextResponse.json({ success: false, message: 'No face profile found.', hasProfile: false }, { status: 404 })
+    const listData = await listRes.json()
+    const profiles = listData.documents || []
+    const profile = profiles.find((p: any) => p.user_id === userId)
 
-    const profile = profileData.documents[0]
+    if (!profile) return NextResponse.json({ success: false, message: 'No face profile found.', hasProfile: false }, { status: 404 })
+
     const storedEmbedding = JSON.parse(profile.face_embedding)
     const similarity = euclideanDistance(embedding, storedEmbedding)
     const threshold = 0.6
@@ -75,13 +78,16 @@ export async function GET(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
 
-    const profileUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?queries=["equal(\'user_id\',\'' + userId + '\")]'
-    const res = await fetch(profileUrl, {
+    const listUrl = ep + '/databases/' + dbid + '/collections/' + bcid + '/documents?limit=10000'
+    const listRes = await fetch(listUrl, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
-    const data = await res.json()
-    const hasProfile = data.documents && data.documents.length > 0
-    return NextResponse.json({ success: true, hasProfile, profile: hasProfile ? data.documents[0] : null }, { status: 200 })
+    const listData = await listRes.json()
+    const profiles = listData.documents || []
+    const profile = profiles.find((p: any) => p.user_id === userId)
+
+    const hasProfile = !!profile
+    return NextResponse.json({ success: true, hasProfile, profile: hasProfile ? { ...profile, face_embedding: undefined } : null }, { status: 200 })
   } catch (e) {
     console.error('Profile check error:', e)
     return NextResponse.json({ success: false, message: 'Failed to check profile.' }, { status: 500 })

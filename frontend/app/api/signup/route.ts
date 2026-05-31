@@ -38,19 +38,23 @@ export async function POST(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const cid = process.env.APPWRITE_USERS_COLLECTION_ID || 'users'
 
-    // Check existing users using queries param
-    const checkUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents?queries=["equal(\'username\',\'' + username + '\")]'
-    const checkRes = await fetch(checkUrl, {
-      method: 'GET',
-      headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak },
+    // List all users and filter in-memory (queries param not supported by standard API key)
+    const listUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents?limit=10000'
+    const listRes = await fetch(listUrl, {
+      headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
-    const checkData = await checkRes.json()
-    if (checkData.documents && checkData.documents.length > 0)
+    const listData = await listRes.json()
+    const users = listData.documents || []
+    
+    // Check for existing user
+    const existing = users.find((u: any) => u.username === username)
+    if (existing)
       return NextResponse.json({ success: false, message: 'Username already exists.' }, { status: 409 })
 
     const salt = generateSalt()
     const hash = hashPassword(password, salt)
 
+    // Create new user
     const createUrl = ep + '/databases/' + dbid + '/collections/' + cid + '/documents'
     const createRes = await fetch(createUrl, {
       method: 'POST',
