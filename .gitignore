@@ -1,0 +1,7 @@
+# Build output
+.next/
+node_modules/
+tsconfig.tsbuildinfo
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
