@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const cid = process.env.APPWRITE_USERS_COLLECTION_ID || 'users'
 
-    const res = await fetch(`${ep}/databases/${dbid}/collections/${cid}/docs?queries=["equal('username','${username}')"]`, {
+    const res = await fetch(`${ep}/databases/${dbid}/collections/${cid}/documents?queries=["equal('username','${username}')"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const data = await res.json()
@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Update last login
-    await fetch(`${ep}/databases/${dbid}/collections/${cid}/docs/${user.$id}`, {
+    await fetch(`${ep}/databases/${dbid}/collections/${cid}/documents/${user.$id}`, {
       method: 'PATCH',
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: { last_login: new Date().toISOString() } }),
@@ -53,7 +53,7 @@ export async function POST(req: NextRequest) {
     RATE_LIMIT_MAP.delete(key)
 
     // Check biometric
-    const bres = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'}/docs?queries=["equal('user_id','${user.$id}')"]`, {
+    const bres = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'}/documents?queries=["equal('user_id','${user.$id}')"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const bdata = await bres.json()

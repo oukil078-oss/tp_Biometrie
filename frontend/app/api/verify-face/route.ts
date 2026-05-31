@@ -17,7 +17,7 @@ export async function POST(req: NextRequest) {
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
     const acid = process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'
 
-    const profileRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/docs?queries=["equal('user_id','${userId}')"]`, {
+    const profileRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents?queries=["equal('user_id','${userId}')"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const profileData = await profileRes.json()
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (isMatch) {
-      await fetch(`${ep}/databases/${dbid}/collections/${bcid}/docs/${profile.$id}`, {
+      await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents/${profile.$id}`, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: { last_verification: new Date().toISOString() } }),
@@ -72,7 +72,7 @@ export async function GET(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
 
-    const res = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/docs?queries=["equal('user_id','${userId}')"]`, {
+    const res = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents?queries=["equal('user_id','${userId}')"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const data = await res.json()

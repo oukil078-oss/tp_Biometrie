@@ -9,7 +9,7 @@ export async function POST(req: NextRequest) {
       const pid = process.env.APPWRITE_PROJECT_ID || ''
       const ak = process.env.APPWRITE_API_KEY || ''
       const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
-      await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_USERS_COLLECTION_ID || 'users'}/docs/${userId}`, {
+      await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_USERS_COLLECTION_ID || 'users'}/documents/${userId}`, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: { last_login: '' } }),

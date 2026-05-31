@@ -12,21 +12,21 @@ export async function GET(req: NextRequest) {
     const dbid = process.env.APPWRITE_DATABASE_ID || 'biometrie_db'
 
     // Fetch user
-    const userRes = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_USERS_COLLECTION_ID || 'users'}/docs/${userId}`, {
+    const userRes = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_USERS_COLLECTION_ID || 'users'}/documents/${userId}`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     if (!userRes.ok) return NextResponse.json({ success: false, message: 'User not found.' }, { status: 404 })
     const userData = await userRes.json()
 
     // Fetch biometric profile
-    const bioRes = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'}/docs?queries=["equal('user_id','${userId}')"]`, {
+    const bioRes = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'}/documents?queries=["equal('user_id','${userId}')"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const bioData = await bioRes.json()
     const biometricProfile = bioData.documents?.[0] || null
 
     // Fetch audit logs
-    const auditRes = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'}/docs?queries=["equal('user_id','${userId}')","orderDesc('timestamp')","limit(10)"]`, {
+    const auditRes = await fetch(`${ep}/databases/${dbid}/collections/${process.env.APPWRITE_AUDIT_COLLECTION_ID || 'audit_logs'}/documents?queries=["equal('user_id','${userId}')","orderDesc('timestamp')","limit(10)"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const auditData = await auditRes.json()

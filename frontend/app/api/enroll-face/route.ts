@@ -15,14 +15,14 @@ export async function POST(req: NextRequest) {
     const bcid = process.env.APPWRITE_BIOMETRICS_COLLECTION_ID || 'biometric_profiles'
 
     // Check existing profile
-    const existingRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/docs?queries=["equal('user_id','${userId}')"]`, {
+    const existingRes = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents?queries=["equal('user_id','${userId}')"]`, {
       headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak }
     })
     const existing = await existingRes.json()
 
     if (existing.documents?.length > 0) {
       const profileId = existing.documents[0].$id
-      const upd = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/docs/${profileId}`, {
+      const upd = await fetch(`${ep}/databases/${dbid}/collections/${bcid}/documents/${profileId}`, {
         method: 'PATCH',
         headers: { 'X-Appwrite-Project': pid, 'X-Appwrite-Key': ak, 'Content-Type': 'application/json' },
         body: JSON.stringify({
