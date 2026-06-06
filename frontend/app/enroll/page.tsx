@@ -43,72 +43,126 @@ function CameraPreview({
   primaryButton,
   secondaryButton,
 }: CameraPreviewProps) {
-  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const mountedRef = useRef(true)
+  const startingRef = useRef(false)
   const [cameraState, setCameraState] = useState<'idle' | 'starting' | 'ready' | 'error'>('idle')
   const [errorMsg, setErrorMsg] = useState('')
-  const startedRef = useRef(false)
   const onFaceDetectedRef = useRef(onFaceDetected)
   const onCameraReadyRef = useRef(onCameraReady)
 
   // Keep refs updated without causing re-renders of effects
-  useEffect(() => {
-    onFaceDetectedRef.current = onFaceDetected
-  }, [onFaceDetected])
+  useEffect(() => { onFaceDetectedRef.current = onFaceDetected }, [onFaceDetected])
+  useEffect(() => { onCameraReadyRef.current = onCameraReady }, [onCameraReady])
 
+  // Mounted tracking – guards async callbacks against post-unmount state writes
   useEffect(() => {
-    onCameraReadyRef.current = onCameraReady
-  }, [onCameraReady])
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
-  /* ---- start camera ---- */
+  /* ---------------------------------------------------------------- */
+  /*  stopStream – safely tear down the current MediaStream            */
+  /* ---------------------------------------------------------------- */
+  const stopStream = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
+    const video = videoRef.current
+    if (video) {
+      video.srcObject = null
+      video.load() // release any pending decode
+    }
+  }, [])
+
+  /* ---------------------------------------------------------------- */
+  /*  startFaceDetection – periodic single-face detection loop         */
+  /* ---------------------------------------------------------------- */
+  const startFaceDetection = useCallback(() => {
+    if (detectionRef.current) {
+      clearInterval(detectionRef.current)
+      detectionRef.current = null
+    }
+
+    console.log('[CameraPreview] Starting face detection loop')
+    detectionRef.current = setInterval(async () => {
+      const video = videoRef.current
+      if (!video || video.readyState < 2) return
+      try {
+        const det = await faceapi.detectSingleFace(video)
+        onFaceDetectedRef.current(!!det, det?.score ?? 0)
+      } catch {
+        onFaceDetectedRef.current(false, 0)
+      }
+    }, 500)
+  }, [])
+
+  /* ---------------------------------------------------------------- */
+  /*  startCamera – obtain MediaStream & bind it to <video>            */
+  /* ---------------------------------------------------------------- */
   const startCamera = useCallback(async () => {
-    if (startedRef.current) return
+    /* ---- guards ---- */
+    if (startingRef.current) return
     if (!modelsReady) {
       console.log('[CameraPreview] Models not ready yet, skipping start')
       return
     }
 
-    startedRef.current = true
+    startingRef.current = true
     console.log('[CameraPreview] Starting camera...')
     setErrorMsg('')
-    setCameraState('starting')
 
-    // Stop existing stream
-    if (streamRef.current) {
-      console.log('[CameraPreview] Stopping existing stream')
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
+    /* ---- stop any previous stream ---- */
+    stopStream()
+
+    /* ---- set state to "starting" (shows loading overlay) ---- */
+    if (mountedRef.current) setCameraState('starting')
 
     try {
+      /* 1. Request camera */
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
         audio: false,
       })
+
+      /* Bail out if component unmounted while waiting for permission */
+      if (!mountedRef.current) {
+        stream.getTracks().forEach(t => t.stop())
+        return
+      }
+
+      /* Validate stream has video tracks */
+      if (stream.getVideoTracks().length === 0) {
+        stream.getTracks().forEach(t => t.stop())
+        throw new Error('No video tracks found in camera stream.')
+      }
+
       streamRef.current = stream
       console.log('[CameraPreview] Stream obtained:', stream.id, 'tracks:', stream.getTracks().length)
 
-      // Wait for video element to exist
+      /* 2. Grab video element */
       const video = videoRef.current
       if (!video) {
-        throw new Error('Video element not found in DOM')
+        stream.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        throw new Error('Video element not found in DOM.')
       }
 
-      console.log('[CameraPreview] Video element found, assigning stream...')
-
-      // Set all required attributes for cross-browser compatibility
-      video.srcObject = stream
-      video.setAttribute('autoplay', '')
-      video.setAttribute('playsinline', '')
-      video.setAttribute('muted', '')
+      /* 3. Set playback attributes BEFORE assigning srcObject */
+      video.muted = true
       video.autoplay = true
       video.playsInline = true
-      video.muted = true
 
-      // Wait for video to have data
+      /* 4. Assign stream */
+      video.srcObject = stream
+      console.log('[CameraPreview] srcObject assigned')
+
+      /* 5. Wait for actual video data (loadeddata ≥ HAVE_CURRENT_DATA) */
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Video loading timeout')), 10000)
+        const timeout = setTimeout(() => reject(new Error('Camera initialization timed out. Please try again.')), 15_000)
 
         if (video.readyState >= 2) {
           clearTimeout(timeout)
@@ -116,146 +170,145 @@ function CameraPreview({
           return
         }
 
-        const onLoaded = () => {
-          console.log('[CameraPreview] loadedmetadata fired')
-          clearTimeout(timeout)
-          resolve()
-        }
-        video.addEventListener('loadedmetadata', onLoaded, { once: true })
-        video.addEventListener('error', () => {
-          clearTimeout(timeout)
-          reject(new Error('Video element error'))
-        }, { once: true })
+        const done = () => { clearTimeout(timeout); resolve() }
+        const fail = () => { clearTimeout(timeout); reject(new Error('Video element encountered an error.')) }
+
+        video.addEventListener('loadeddata', done, { once: true })
+        video.addEventListener('error', fail, { once: true })
       })
 
-      console.log('[CameraPreview] Video readyState:', video.readyState, 'dimensions:', video.videoWidth, 'x', video.videoHeight)
+      if (!mountedRef.current) return
 
-      // Try to play - but don't fail if rejected (video may still render)
+      /* 6. Explicitly play (with retry) */
       try {
         await video.play()
-        console.log('[CameraPreview] Video.play() succeeded')
+        console.log('[CameraPreview] play() succeeded')
       } catch (playErr) {
-        console.warn('[CameraPreview] play() rejected:', playErr)
-        if (video.readyState < 2) {
-          throw new Error('Video playback failed - no data available')
+        console.warn('[CameraPreview] play() rejected on first attempt:', playErr)
+        // Retry once – sometimes the browser needs a second attempt after loadeddata
+        await new Promise(r => setTimeout(r, 100))
+        try {
+          await video.play()
+          console.log('[CameraPreview] play() succeeded on retry')
+        } catch {
+          // If still failing but video has data, continue – the stream may still render
+          if (video.readyState < 2) throw new Error('Video playback failed – no data available.')
+          console.log('[CameraPreview] Continuing despite play() rejection (readyState OK)')
         }
-        console.log('[CameraPreview] Video has data despite play() rejection, continuing')
       }
 
+      /* 7. Wait for real video dimensions (non-zero) */
+      if (video.videoWidth === 0 || video.videoHeight === 0) {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Camera produced no video frames.')), 5_000)
+          const check = () => {
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+              clearTimeout(timeout)
+              resolve()
+            }
+          }
+          video.addEventListener('resize', () => check(), { once: true })
+          check()
+        })
+      }
+
+      if (!mountedRef.current) return
+
+      console.log('[CameraPreview] Camera ready!', video.videoWidth, 'x', video.videoHeight)
       setCameraState('ready')
       onCameraReadyRef.current(video, streamRef.current)
-      startedRef.current = false
-
-      // Start face detection
+      startingRef.current = false
       startFaceDetection()
     } catch (err: unknown) {
-      console.error('[CameraPreview] Camera error:', err)
-      startedRef.current = false
+      if (!mountedRef.current) { startingRef.current = false; return }
 
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop())
-        streamRef.current = null
-      }
+      console.error('[CameraPreview] Camera error:', err)
+      startingRef.current = false
+      stopStream()
 
       const e = err as Error
-      if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied. Please allow access.')
+      if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied. Please allow camera access in your browser settings and try again.')
       else if (e.name === 'NotFoundError') setErrorMsg('No camera found on this device.')
-      else if (e.name === 'NotReadableError') setErrorMsg('Camera is in use by another app.')
-      else setErrorMsg(`Camera error: ${e.message}`)
+      else if (e.name === 'NotReadableError') setErrorMsg('Camera is in use by another application. Close other apps using the camera.')
+      else setErrorMsg(e.message || 'Failed to start camera.')
 
       setCameraState('error')
       onCameraReadyRef.current(null, null)
     }
-  }, [modelsReady])
+  }, [modelsReady, stopStream, startFaceDetection])
 
-  /* ---- face detection ---- */
-  const startFaceDetection = useCallback(() => {
-    console.log('[CameraPreview] Starting face detection loop')
-
-    if (detectionRef.current) {
-      clearInterval(detectionRef.current)
-      detectionRef.current = null
-    }
-
-    detectionRef.current = setInterval(async () => {
-      const video = videoRef.current
-      if (!video || video.readyState < 2) return
-
-      try {
-        const det = await faceapi.detectSingleFace(video)
-        if (det) {
-          console.log('[CameraPreview] Face detected! Score:', det.score)
-          onFaceDetectedRef.current(true, det.score)
-        } else {
-          onFaceDetectedRef.current(false, 0)
-        }
-      } catch (e) {
-        console.warn('[CameraPreview] Detection error:', e)
-        onFaceDetectedRef.current(false, 0)
-      }
-    }, 500)
-  }, [])
-
-  /* ---- stop camera ---- */
+  /* ---------------------------------------------------------------- */
+  /*  stopCamera – full teardown                                       */
+  /* ---------------------------------------------------------------- */
   const stopCamera = useCallback(() => {
     console.log('[CameraPreview] Stopping camera')
-    startedRef.current = false
+    startingRef.current = false
 
     if (detectionRef.current) {
       clearInterval(detectionRef.current)
       detectionRef.current = null
     }
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
-
-    const video = videoRef.current
-    if (video) video.srcObject = null
+    stopStream()
 
     setCameraState('idle')
     setErrorMsg('')
     onCameraReadyRef.current(null, null)
     onFaceDetectedRef.current(false, 0)
-  }, [])
+  }, [stopStream])
 
-  /* ---- auto-start when isActive or modelsReady ---- */
+  /* ---------------------------------------------------------------- */
+  /*  Auto-start / auto-stop effect                                    */
+  /* ---------------------------------------------------------------- */
   useEffect(() => {
-    if (isActive && cameraState === 'idle' && modelsReady && !startedRef.current) {
+    if (isActive && cameraState === 'idle' && modelsReady && !startingRef.current) {
       console.log('[CameraPreview] Auto-starting camera')
       startCamera()
     }
 
     if (!isActive && (cameraState === 'ready' || cameraState === 'starting')) {
-      console.log('[CameraPreview] Deactivating - stopping camera')
+      console.log('[CameraPreview] Deactivating – stopping camera')
       stopCamera()
     }
   }, [isActive, cameraState, modelsReady, startCamera, stopCamera])
 
-  /* ---- cleanup on unmount ---- */
+  /* ---------------------------------------------------------------- */
+  /*  Cleanup on unmount – stop stream & reset guards                  */
+  /* ---------------------------------------------------------------- */
   useEffect(() => {
     return () => {
-      console.log('[CameraPreview] Unmounting - cleanup')
+      console.log('[CameraPreview] Unmounting – full cleanup')
+      startingRef.current = false
+      mountedRef.current = false
       if (detectionRef.current) clearInterval(detectionRef.current)
-      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
     }
   }, [])
+
+  /* ---- Manual retry handler ---- */
+  const handleRetry = useCallback(() => {
+    setErrorMsg('')
+    setCameraState('idle')
+    startingRef.current = false
+    // Defer startCamera to next tick so state settles
+    setTimeout(() => startCamera(), 50)
+  }, [startCamera])
 
   return (
     <div className="space-y-4">
       {/* Camera preview container */}
       <div className="relative rounded-2xl overflow-hidden bg-secondary aspect-video">
-        {/* Video element - ALWAYS in DOM, ALWAYS visible */}
+        {/* Video element – ALWAYS in DOM, ALWAYS rendered */}
         <video
           ref={videoRef}
           autoPlay
           playsInline
           muted
           className="w-full h-full object-cover"
-          style={{
-            transform: 'scaleX(-1)',
-          }}
+          style={{ transform: 'scaleX(-1)' }}
         />
 
         {/* Loading overlay */}
@@ -271,10 +324,7 @@ function CameraPreview({
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
             <AlertCircle className="w-10 h-10 text-red-400" />
             <span className="text-sm text-red-400 text-center px-6">{errorMsg}</span>
-            <button
-              onClick={() => { setErrorMsg(''); setCameraState('idle'); startedRef.current = false; startCamera() }}
-              className="btn-primary text-sm px-4 py-2"
-            >
+            <button onClick={handleRetry} className="btn-primary text-sm px-4 py-2">
               Retry <Camera className="w-4 h-4 ml-1" />
             </button>
           </div>
@@ -302,16 +352,24 @@ function CameraPreview({
 
       {/* Action buttons */}
       <div className="flex gap-3">
-        {/* Manual start button */}
+        {/* Manual start button – shown when auto-start didn't fire */}
         {cameraState === 'idle' && isActive && (
-          <button onClick={startCamera} disabled={!modelsReady} className="w-full btn-primary disabled:opacity-50">
+          <button
+            onClick={startCamera}
+            disabled={!modelsReady}
+            className="w-full btn-primary disabled:opacity-50"
+          >
             <Camera className="w-5 h-5 mr-2" /> Open Camera
           </button>
         )}
 
-        {/* Primary action button */}
+        {/* Primary action button – only when camera is live */}
         {cameraState === 'ready' && primaryButton && (
-          <button onClick={primaryButton.onClick} disabled={primaryButton.disabled} className="w-full btn-primary disabled:opacity-50">
+          <button
+            onClick={primaryButton.onClick}
+            disabled={primaryButton.disabled}
+            className="w-full btn-primary disabled:opacity-50"
+          >
             {primaryButton.label}
           </button>
         )}
@@ -361,7 +419,7 @@ export default function EnrollPage() {
         console.log('[Enroll] Models loaded successfully')
       } catch (err) {
         console.error('[Enroll] Model load failed:', err)
-        setError('Failed to load face detection models. Please refresh.')
+        setError('Failed to load face detection models. Please refresh the page.')
       }
     }
     loadModels()
@@ -370,7 +428,7 @@ export default function EnrollPage() {
       if (captureTimerRef.current) clearTimeout(captureTimerRef.current)
       if (cameraStream) cameraStream.getTracks().forEach(t => t.stop())
     }
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* Handle camera ready state from CameraPreview */
   const handleCameraReady = useCallback((video: HTMLVideoElement | null, stream: MediaStream | null) => {
@@ -382,7 +440,6 @@ export default function EnrollPage() {
 
   /* Handle face detection updates from CameraPreview */
   const handleFaceDetected = useCallback((detected: boolean, score: number) => {
-    console.log('[Enroll] Face detection:', detected, score)
     setFaceDetected(detected)
     setConfidence(score)
   }, [])
@@ -390,7 +447,6 @@ export default function EnrollPage() {
   /* Capture a single face sample */
   const captureSample = useCallback(async () => {
     if (!videoEl || videoEl.readyState < 2) {
-      console.warn('[Enroll] Video not ready for capture')
       setError('Camera preview not ready.')
       return
     }
@@ -422,7 +478,7 @@ export default function EnrollPage() {
       console.error('[Enroll] Capture error:', err)
       setError('Failed to capture face sample.')
     }
-  }, [videoEl, captureCount])
+  }, [videoEl, captureCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* Process enrollment with the final captured image */
   const processEnrollment = useCallback(async (finalImage: string) => {
@@ -434,7 +490,6 @@ export default function EnrollPage() {
       const det = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor()
 
       if (!det) {
-        console.warn('[Enroll] No face found in captured image')
         setError('Could not detect face. Try again with better lighting.')
         setProcessing(false)
         setCurrentStep(2)
@@ -455,11 +510,9 @@ export default function EnrollPage() {
       const data = await res.json()
 
       if (data.success) {
-        console.log('[Enroll] Enrollment successful')
         setSuccess(true)
         setCurrentStep(5)
       } else {
-        console.warn('[Enroll] Server enrollment failed:', data.message)
         setError(data.message || 'Enrollment failed.')
         setCurrentStep(2)
         setCaptureCount(0)
@@ -637,7 +690,6 @@ export default function EnrollPage() {
                 label: 'Continue to Capture',
                 onClick: () => {
                   if (faceDetected) {
-                    console.log('[Enroll] Moving to capture step')
                     setCurrentStep(3)
                     setCaptureCount(0)
                     setFaceDetected(false)

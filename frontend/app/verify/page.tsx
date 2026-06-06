@@ -18,118 +18,66 @@ const MAX_RETRIES = 3
 
 interface CameraPreviewProps {
   isActive: boolean
-  modelsReadyRef: React.MutableRefObject<boolean>
+  modelsReady: boolean
   onStatusChange: (status: 'camera' | 'detecting' | 'verifying' | 'error') => void
   onFaceDetected: (detected: boolean, score: number) => void
   onVerifyFace: (embedding: number[], score: number) => Promise<void>
 }
 
-function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetected, onVerifyFace }: CameraPreviewProps) {
-  const videoRef = useRef<HTMLVideoElement | null>(null)
+function CameraPreview({
+  isActive,
+  modelsReady,
+  onStatusChange,
+  onFaceDetected,
+  onVerifyFace,
+}: CameraPreviewProps) {
+  const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const mountedRef = useRef(true)
+  const startingRef = useRef(false)
+  const verifyingRef = useRef(false)
   const [state, setState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [errorMsg, setErrorMsg] = useState('')
-  const verifyingRef = useRef(false)
-  const startedRef = useRef(false)
+
+  // Keep callback refs updated
   const onFaceDetectedRef = useRef(onFaceDetected)
   const onVerifyFaceRef = useRef(onVerifyFace)
   const onStatusChangeRef = useRef(onStatusChange)
-
-  // Keep refs updated
   useEffect(() => { onFaceDetectedRef.current = onFaceDetected }, [onFaceDetected])
   useEffect(() => { onVerifyFaceRef.current = onVerifyFace }, [onVerifyFace])
   useEffect(() => { onStatusChangeRef.current = onStatusChange }, [onStatusChange])
 
-  /* ---- start camera ---- */
-  const startCamera = useCallback(async () => {
-    if (startedRef.current) return
-    if (!modelsReadyRef.current) {
-      console.log('[Verify CameraPreview] Models not ready, skipping')
-      return
-    }
+  // Mounted tracking
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
-    startedRef.current = true
-    console.log('[Verify CameraPreview] Starting camera...')
-    setErrorMsg('')
-    setState('loading')
-    verifyingRef.current = false
-
-    // Stop existing stream
+  /* ---------------------------------------------------------------- */
+  /*  stopStream                                                       */
+  /* ---------------------------------------------------------------- */
+  const stopStream = useCallback(() => {
     if (streamRef.current) {
-      console.log('[Verify CameraPreview] Stopping existing stream')
       streamRef.current.getTracks().forEach(t => t.stop())
       streamRef.current = null
     }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-        audio: false,
-      })
-      streamRef.current = stream
-      console.log('[Verify CameraPreview] Stream obtained:', stream.id)
-
-      const video = videoRef.current
-      if (!video) {
-        throw new Error('Video element not found')
-      }
-
-      console.log('[Verify CameraPreview] Assigning stream to video...')
-      video.srcObject = stream
-      video.setAttribute('autoplay', '')
-      video.setAttribute('playsinline', '')
-      video.setAttribute('muted', '')
-      video.autoplay = true
-      video.playsInline = true
-      video.muted = true
-
-      // Wait for video data
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Video loading timeout')), 10000)
-        if (video.readyState >= 2) { clearTimeout(timeout); resolve(); return }
-        video.addEventListener('loadedmetadata', () => { clearTimeout(timeout); resolve() }, { once: true })
-        video.addEventListener('error', () => { clearTimeout(timeout); reject(new Error('Video error')) }, { once: true })
-      })
-
-      console.log('[Verify CameraPreview] Video readyState:', video.readyState)
-
-      // Try to play
-      try {
-        await video.play()
-        console.log('[Verify CameraPreview] Video.play() succeeded')
-      } catch (playErr) {
-        console.warn('[Verify CameraPreview] play() rejected:', playErr)
-        if (video.readyState < 2) throw new Error('Video playback failed')
-      }
-
-      setState('ready')
-      startedRef.current = false
-      onStatusChangeRef.current('camera')
-
-      // Start face detection
-      startFaceDetection()
-    } catch (err: unknown) {
-      console.error('[Verify CameraPreview] Camera error:', err)
-      startedRef.current = false
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop())
-        streamRef.current = null
-      }
-
-      const e = err as Error
-      if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied.')
-      else if (e.name === 'NotFoundError') setErrorMsg('No camera found.')
-      else if (e.name === 'NotReadableError') setErrorMsg('Camera in use by another app.')
-      else setErrorMsg(`Camera error: ${e.message}`)
-
-      setState('error')
-      onStatusChangeRef.current('error')
+    const video = videoRef.current
+    if (video) {
+      video.srcObject = null
+      video.load()
     }
-  }, [modelsReadyRef])
+  }, [])
 
-  /* ---- face detection ---- */
+  /* ---------------------------------------------------------------- */
+  /*  startFaceDetection                                               */
+  /* ---------------------------------------------------------------- */
   const startFaceDetection = useCallback(() => {
+    if (detectionRef.current) {
+      clearInterval(detectionRef.current)
+      detectionRef.current = null
+    }
+
     console.log('[Verify CameraPreview] Starting face detection')
     onFaceDetectedRef.current(false, 0)
 
@@ -144,7 +92,7 @@ function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetecte
           if (det.score > 0.5 && !verifyingRef.current) {
             verifyingRef.current = true
             console.log('[Verify CameraPreview] Face detected! Starting verification...')
-            onStatusChangeRef.current('verifying')
+            if (mountedRef.current) onStatusChangeRef.current('verifying')
 
             clearInterval(detectionRef.current!)
             detectionRef.current = null
@@ -164,15 +112,19 @@ function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetecte
                 if (imgDet) {
                   await onVerifyFaceRef.current(Array.from(imgDet.descriptor), det.score)
                 } else {
-                  setErrorMsg('Could not extract face features.')
-                  verifyingRef.current = false
-                  onStatusChangeRef.current('error')
+                  if (mountedRef.current) {
+                    setErrorMsg('Could not extract face features.')
+                    verifyingRef.current = false
+                    onStatusChangeRef.current('error')
+                  }
                 }
               } catch (verifyErr) {
                 console.error('[Verify CameraPreview] Verification error:', verifyErr)
-                setErrorMsg('Verification failed.')
-                verifyingRef.current = false
-                onStatusChangeRef.current('error')
+                if (mountedRef.current) {
+                  setErrorMsg('Verification failed.')
+                  verifyingRef.current = false
+                  onStatusChangeRef.current('error')
+                }
               }
             }
           }
@@ -185,23 +137,157 @@ function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetecte
     }, 500)
   }, [])
 
-  /* ---- stop camera ---- */
+  /* ---------------------------------------------------------------- */
+  /*  startCamera                                                      */
+  /* ---------------------------------------------------------------- */
+  const startCamera = useCallback(async () => {
+    if (startingRef.current) return
+    if (!modelsReady) {
+      console.log('[Verify CameraPreview] Models not ready, skipping')
+      return
+    }
+
+    startingRef.current = true
+    console.log('[Verify CameraPreview] Starting camera...')
+    setErrorMsg('')
+    verifyingRef.current = false
+
+    stopStream()
+
+    if (mountedRef.current) setState('loading')
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+        audio: false,
+      })
+
+      if (!mountedRef.current) {
+        stream.getTracks().forEach(t => t.stop())
+        return
+      }
+
+      // Validate stream
+      if (stream.getVideoTracks().length === 0) {
+        stream.getTracks().forEach(t => t.stop())
+        throw new Error('No video tracks found in camera stream.')
+      }
+
+      streamRef.current = stream
+      console.log('[Verify CameraPreview] Stream obtained:', stream.id)
+
+      const video = videoRef.current
+      if (!video) {
+        stream.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        throw new Error('Video element not found.')
+      }
+
+      // Set attributes BEFORE srcObject
+      video.muted = true
+      video.autoplay = true
+      video.playsInline = true
+
+      // Assign stream
+      video.srcObject = stream
+      console.log('[Verify CameraPreview] srcObject assigned')
+
+      // Wait for video data (loadeddata, not just loadedmetadata)
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Camera initialization timed out.')), 15_000)
+
+        if (video.readyState >= 2) {
+          clearTimeout(timeout)
+          resolve()
+          return
+        }
+
+        const done = () => { clearTimeout(timeout); resolve() }
+        const fail = () => { clearTimeout(timeout); reject(new Error('Video element error.')) }
+
+        video.addEventListener('loadeddata', done, { once: true })
+        video.addEventListener('loadedmetadata', done, { once: true })
+        video.addEventListener('error', fail, { once: true })
+      })
+
+      if (!mountedRef.current) return
+
+      // Explicitly play (with retry)
+      try {
+        await video.play()
+        console.log('[Verify CameraPreview] play() succeeded')
+      } catch (playErr) {
+        console.warn('[Verify CameraPreview] play() rejected on first attempt:', playErr)
+        await new Promise(r => setTimeout(r, 100))
+        try {
+          await video.play()
+          console.log('[Verify CameraPreview] play() succeeded on retry')
+        } catch {
+          if (video.readyState < 2) throw new Error('Video playback failed.')
+          console.log('[Verify CameraPreview] Continuing despite play() rejection')
+        }
+      }
+
+      // Wait for real video dimensions
+      if (video.videoWidth === 0 || video.videoHeight === 0) {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Camera produced no video frames.')), 5_000)
+          const check = () => {
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+              clearTimeout(timeout)
+              resolve()
+            }
+          }
+          video.addEventListener('resize', () => check(), { once: true })
+          check()
+        })
+      }
+
+      if (!mountedRef.current) return
+
+      console.log('[Verify CameraPreview] Camera ready!', video.videoWidth, 'x', video.videoHeight)
+      setState('ready')
+      startingRef.current = false
+      onStatusChangeRef.current('camera')
+
+      startFaceDetection()
+    } catch (err: unknown) {
+      if (!mountedRef.current) { startingRef.current = false; return }
+
+      console.error('[Verify CameraPreview] Camera error:', err)
+      startingRef.current = false
+      stopStream()
+
+      const e = err as Error
+      if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied. Please allow camera access.')
+      else if (e.name === 'NotFoundError') setErrorMsg('No camera found on this device.')
+      else if (e.name === 'NotReadableError') setErrorMsg('Camera is in use by another application.')
+      else setErrorMsg(e.message || 'Camera error.')
+
+      setState('error')
+      onStatusChangeRef.current('error')
+    }
+  }, [modelsReady, stopStream, startFaceDetection])
+
+  /* ---------------------------------------------------------------- */
+  /*  stopCamera                                                       */
+  /* ---------------------------------------------------------------- */
   const stopCamera = useCallback(() => {
     console.log('[Verify CameraPreview] Stopping camera')
-    startedRef.current = false
+    startingRef.current = false
+    verifyingRef.current = false
     if (detectionRef.current) { clearInterval(detectionRef.current); detectionRef.current = null }
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
-    const video = videoRef.current
-    if (video) video.srcObject = null
+    stopStream()
     setState('idle')
     setErrorMsg('')
     onFaceDetectedRef.current(false, 0)
-    verifyingRef.current = false
-  }, [])
+  }, [stopStream])
 
-  /* ---- auto-start ---- */
+  /* ---------------------------------------------------------------- */
+  /*  Auto-start / auto-stop                                           */
+  /* ---------------------------------------------------------------- */
   useEffect(() => {
-    if (isActive && state === 'idle' && modelsReadyRef.current && !startedRef.current) {
+    if (isActive && state === 'idle' && modelsReady && !startingRef.current) {
       console.log('[Verify CameraPreview] Auto-starting camera')
       startCamera()
     }
@@ -209,20 +295,34 @@ function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetecte
       console.log('[Verify CameraPreview] Deactivating')
       stopCamera()
     }
-  }, [isActive, state, modelsReadyRef, startCamera, stopCamera])
+  }, [isActive, state, modelsReady, startCamera, stopCamera])
 
-  /* ---- cleanup ---- */
+  /* ---------------------------------------------------------------- */
+  /*  Cleanup on unmount                                               */
+  /* ---------------------------------------------------------------- */
   useEffect(() => {
     return () => {
-      console.log('[Verify CameraPreview] Cleanup')
+      startingRef.current = false
+      mountedRef.current = false
       if (detectionRef.current) clearInterval(detectionRef.current)
-      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop())
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
     }
   }, [])
 
+  /* ---- Manual retry handler ---- */
+  const handleRetry = useCallback(() => {
+    setErrorMsg('')
+    setState('idle')
+    startingRef.current = false
+    setTimeout(() => startCamera(), 50)
+  }, [startCamera])
+
   return (
     <div className="relative rounded-2xl overflow-hidden bg-secondary aspect-video mb-6">
-      {/* Video - ALWAYS in DOM and visible */}
+      {/* Video – ALWAYS in DOM and visible */}
       <video
         ref={videoRef}
         autoPlay
@@ -245,6 +345,9 @@ function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetecte
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
           <AlertCircle className="w-10 h-10 text-red-400" />
           <span className="text-sm text-red-400 text-center px-6">{errorMsg}</span>
+          <button onClick={handleRetry} className="btn-primary text-sm px-4 py-2">
+            Retry <Camera className="w-4 h-4 ml-1" />
+          </button>
         </div>
       )}
 
@@ -253,6 +356,11 @@ function CameraPreview({ isActive, modelsReadyRef, onStatusChange, onFaceDetecte
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
           <Camera className="w-12 h-12 text-muted-foreground" />
           <span className="text-sm text-muted-foreground">Camera is off</span>
+          {isActive && (
+            <button onClick={startCamera} disabled={!modelsReady} className="btn-primary text-sm px-4 py-2 mt-2 disabled:opacity-50">
+              <Camera className="w-4 h-4 mr-1" /> Open Camera
+            </button>
+          )}
         </div>
       )}
 
@@ -293,9 +401,9 @@ export default function VerifyPage() {
   const [showPasswordFallback, setShowPasswordFallback] = useState(false)
   const [password, setPassword] = useState('')
   const [faceDetected, setFaceDetected] = useState(false)
+  const [modelsReady, setModelsReady] = useState(false)  // ← STATE, not ref!
 
   const streamRef = useRef<MediaStream | null>(null)
-  const modelsReady = useRef(false)
 
   /* Load face-api models */
   useEffect(() => {
@@ -307,14 +415,19 @@ export default function VerifyPage() {
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
         ])
-        modelsReady.current = true
+        setModelsReady(true)
         console.log('[Verify] Models loaded')
       } catch {
         setError('Failed to load face detection models.')
       }
     }
     load()
-    return () => { if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null } }
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
+    }
   }, [])
 
   /* Check enrollment */
@@ -413,13 +526,15 @@ export default function VerifyPage() {
             <p className="text-muted-foreground">{message}</p>
           </div>
 
-          {/* Messages */}
+          {/* Error message */}
           {error && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20 mb-6">
               <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
               <p className="text-sm text-red-400">{error}</p>
             </div>
           )}
+
+          {/* Success message */}
           {status === 'success' && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 mb-6">
               <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -436,16 +551,16 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Camera Preview - ALWAYS mounted */}
+          {/* Camera Preview – ALWAYS mounted */}
           <CameraPreview
             isActive={status === 'camera' || status === 'detecting' || status === 'verifying'}
+            modelsReady={modelsReady}
             onStatusChange={(newStatus) => {
               if (newStatus === 'camera') { setStatus('camera'); setMessage('Position your face in the frame.') }
               else if (newStatus === 'detecting') { setStatus('detecting'); setMessage('Looking for your face...') }
               else if (newStatus === 'verifying') { setStatus('verifying'); setMessage('Verifying your face...') }
             }}
             onFaceDetected={(detected, score) => { setFaceDetected(detected); setConfidence(score) }}
-            modelsReadyRef={modelsReady}
             onVerifyFace={handleVerifyFace}
           />
 
@@ -485,8 +600,13 @@ export default function VerifyPage() {
           {!showPasswordFallback && (
             <div className="flex gap-3">
               {status === 'idle' && (
-                <button onClick={() => { setError(''); setStatus('camera'); setMessage('Opening camera...') }} className="w-full btn-primary">
-                  <Camera className="w-5 h-5 mr-2" /> Start Verification
+                <button
+                  onClick={() => { setError(''); setStatus('camera'); setMessage('Opening camera...') }}
+                  disabled={!modelsReady}
+                  className="w-full btn-primary disabled:opacity-50"
+                >
+                  <Camera className="w-5 h-5 mr-2" />
+                  {modelsReady ? 'Start Verification' : 'Loading Models...'}
                 </button>
               )}
               {(status === 'detecting' || status === 'camera') && (
