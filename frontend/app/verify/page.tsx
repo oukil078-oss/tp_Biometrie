@@ -48,24 +48,11 @@ function CameraPreview({
   useEffect(() => { onVerifyFaceRef.current = onVerifyFace }, [onVerifyFace])
   useEffect(() => { onStatusChangeRef.current = onStatusChange }, [onStatusChange])
 
-  // Mounted tracking
+  // Mounted tracking – DO NOT reset startingRef here (see enroll page for explanation)
   useEffect(() => {
     mountedRef.current = true
-    return () => { mountedRef.current = false }
-  }, [])
-
-  /* ---------------------------------------------------------------- */
-  /*  stopStream                                                       */
-  /* ---------------------------------------------------------------- */
-  const stopStream = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
-    const video = videoRef.current
-    if (video) {
-      video.srcObject = null
-      video.load()
+    return () => {
+      mountedRef.current = false
     }
   }, [])
 
@@ -97,7 +84,6 @@ function CameraPreview({
             clearInterval(detectionRef.current!)
             detectionRef.current = null
 
-            // Capture frame
             const canvas = document.createElement('canvas')
             canvas.width = video.videoWidth
             canvas.height = video.videoHeight
@@ -131,8 +117,8 @@ function CameraPreview({
         } else {
           onFaceDetectedRef.current(false, 0)
         }
-      } catch (e) {
-        console.warn('[Verify CameraPreview] Detection error:', e)
+      } catch {
+        // detection error, ignore
       }
     }, 500)
   }, [])
@@ -152,7 +138,14 @@ function CameraPreview({
     setErrorMsg('')
     verifyingRef.current = false
 
-    stopStream()
+    // Only stop existing stream if one actually exists
+    if (streamRef.current) {
+      console.log('[Verify CameraPreview] Stopping existing stream')
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+      const v = videoRef.current
+      if (v) v.srcObject = null
+    }
 
     if (mountedRef.current) setState('loading')
 
@@ -164,10 +157,10 @@ function CameraPreview({
 
       if (!mountedRef.current) {
         stream.getTracks().forEach(t => t.stop())
+        startingRef.current = false
         return
       }
 
-      // Validate stream
       if (stream.getVideoTracks().length === 0) {
         stream.getTracks().forEach(t => t.stop())
         throw new Error('No video tracks found in camera stream.')
@@ -183,80 +176,73 @@ function CameraPreview({
         throw new Error('Video element not found.')
       }
 
-      // Set attributes BEFORE srcObject
       video.muted = true
       video.autoplay = true
       video.playsInline = true
-
-      // Assign stream
       video.srcObject = stream
-      console.log('[Verify CameraPreview] srcObject assigned')
+      console.log('[Verify CameraPreview] srcObject assigned, waiting for video data...')
 
-      // Wait for video data (loadeddata, not just loadedmetadata)
+      // Wait for video data using polling + events
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Camera initialization timed out.')), 15_000)
+        const deadline = setTimeout(() => {
+          clearInterval(poll)
+          reject(new Error('Camera initialization timed out.'))
+        }, 15_000)
 
-        if (video.readyState >= 2) {
-          clearTimeout(timeout)
+        let resolved = false
+        const done = () => {
+          if (resolved) return
+          resolved = true
+          clearTimeout(deadline)
+          clearInterval(poll)
           resolve()
-          return
         }
 
-        const done = () => { clearTimeout(timeout); resolve() }
-        const fail = () => { clearTimeout(timeout); reject(new Error('Video element error.')) }
+        const poll = setInterval(() => {
+          if (video.readyState >= 2 && video.videoWidth > 0) done()
+        }, 50)
 
-        video.addEventListener('loadeddata', done, { once: true })
-        video.addEventListener('loadedmetadata', done, { once: true })
-        video.addEventListener('error', fail, { once: true })
+        video.addEventListener('loadeddata', () => done(), { once: true })
+        video.addEventListener('error', () => {
+          if (!resolved) { clearTimeout(deadline); clearInterval(poll); reject(new Error('Video element error.')) }
+        }, { once: true })
+
+        if (video.readyState >= 2 && video.videoWidth > 0) done()
       })
 
-      if (!mountedRef.current) return
+      if (!mountedRef.current) { startingRef.current = false; return }
 
-      // Explicitly play (with retry)
       try {
         await video.play()
         console.log('[Verify CameraPreview] play() succeeded')
-      } catch (playErr) {
-        console.warn('[Verify CameraPreview] play() rejected on first attempt:', playErr)
-        await new Promise(r => setTimeout(r, 100))
+      } catch {
+        await new Promise(r => setTimeout(r, 150))
         try {
           await video.play()
-          console.log('[Verify CameraPreview] play() succeeded on retry')
         } catch {
           if (video.readyState < 2) throw new Error('Video playback failed.')
-          console.log('[Verify CameraPreview] Continuing despite play() rejection')
         }
       }
 
-      // Wait for real video dimensions
-      if (video.videoWidth === 0 || video.videoHeight === 0) {
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error('Camera produced no video frames.')), 5_000)
-          const check = () => {
-            if (video.videoWidth > 0 && video.videoHeight > 0) {
-              clearTimeout(timeout)
-              resolve()
-            }
-          }
-          video.addEventListener('resize', () => check(), { once: true })
-          check()
-        })
-      }
-
-      if (!mountedRef.current) return
+      if (!mountedRef.current) { startingRef.current = false; return }
 
       console.log('[Verify CameraPreview] Camera ready!', video.videoWidth, 'x', video.videoHeight)
       setState('ready')
       startingRef.current = false
       onStatusChangeRef.current('camera')
-
       startFaceDetection()
     } catch (err: unknown) {
       if (!mountedRef.current) { startingRef.current = false; return }
 
       console.error('[Verify CameraPreview] Camera error:', err)
       startingRef.current = false
-      stopStream()
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
+      const v = videoRef.current
+      if (v) v.srcObject = null
 
       const e = err as Error
       if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied. Please allow camera access.')
@@ -267,7 +253,7 @@ function CameraPreview({
       setState('error')
       onStatusChangeRef.current('error')
     }
-  }, [modelsReady, stopStream, startFaceDetection])
+  }, [modelsReady, startFaceDetection])
 
   /* ---------------------------------------------------------------- */
   /*  stopCamera                                                       */
@@ -277,11 +263,13 @@ function CameraPreview({
     startingRef.current = false
     verifyingRef.current = false
     if (detectionRef.current) { clearInterval(detectionRef.current); detectionRef.current = null }
-    stopStream()
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
+    const v = videoRef.current
+    if (v) v.srcObject = null
     setState('idle')
     setErrorMsg('')
     onFaceDetectedRef.current(false, 0)
-  }, [stopStream])
+  }, [])
 
   /* ---------------------------------------------------------------- */
   /*  Auto-start / auto-stop                                           */
@@ -298,12 +286,10 @@ function CameraPreview({
   }, [isActive, state, modelsReady, startCamera, stopCamera])
 
   /* ---------------------------------------------------------------- */
-  /*  Cleanup on unmount                                               */
+  /*  Cleanup on unmount (do NOT reset startingRef)                    */
   /* ---------------------------------------------------------------- */
   useEffect(() => {
     return () => {
-      startingRef.current = false
-      mountedRef.current = false
       if (detectionRef.current) clearInterval(detectionRef.current)
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(t => t.stop())
@@ -312,7 +298,6 @@ function CameraPreview({
     }
   }, [])
 
-  /* ---- Manual retry handler ---- */
   const handleRetry = useCallback(() => {
     setErrorMsg('')
     setState('idle')
@@ -356,8 +341,8 @@ function CameraPreview({
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
           <Camera className="w-12 h-12 text-muted-foreground" />
           <span className="text-sm text-muted-foreground">Camera is off</span>
-          {isActive && (
-            <button onClick={startCamera} disabled={!modelsReady} className="btn-primary text-sm px-4 py-2 mt-2 disabled:opacity-50">
+          {isActive && modelsReady && (
+            <button onClick={startCamera} className="btn-primary text-sm px-4 py-2 mt-2">
               <Camera className="w-4 h-4 mr-1" /> Open Camera
             </button>
           )}
@@ -378,7 +363,7 @@ function CameraPreview({
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-60 border-2 rounded-full transition-all border-primary/30 animate-pulse" />
           <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
             <div className="px-3 py-1.5 rounded-full text-xs font-medium bg-primary/20 text-primary border border-primary/30">
-              {verifyingRef.current ? 'Verifying...' : 'Looking for face...'}
+              Looking for face...
             </div>
           </div>
         </>
@@ -401,9 +386,7 @@ export default function VerifyPage() {
   const [showPasswordFallback, setShowPasswordFallback] = useState(false)
   const [password, setPassword] = useState('')
   const [faceDetected, setFaceDetected] = useState(false)
-  const [modelsReady, setModelsReady] = useState(false)  // ← STATE, not ref!
-
-  const streamRef = useRef<MediaStream | null>(null)
+  const [modelsReady, setModelsReady] = useState(false) // ← STATE not ref!
 
   /* Load face-api models */
   useEffect(() => {
@@ -422,12 +405,6 @@ export default function VerifyPage() {
       }
     }
     load()
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop())
-        streamRef.current = null
-      }
-    }
   }, [])
 
   /* Check enrollment */
@@ -442,7 +419,6 @@ export default function VerifyPage() {
 
   /* Stop camera helper */
   const stopCamera = useCallback(() => {
-    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
     setStatus('idle')
     setMessage('Start verification to compare your face.')
     setFaceDetected(false)
@@ -469,30 +445,24 @@ export default function VerifyPage() {
         console.log('[Verify] Verification successful!')
         setStatus('success')
         setMessage('Face verified successfully!')
-        if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
         fetch('/api/audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, eventType: 'biometric_success', details: 'Face verification successful' }) })
         setTimeout(() => router.push('/dashboard'), 2000)
       } else {
-        console.warn('[Verify] Verification failed:', data.message)
         const nr = retries + 1
         setRetries(nr)
         if (nr >= MAX_RETRIES) {
           setError(`Max retries (${MAX_RETRIES}) reached. Use password fallback.`)
           setStatus('error')
           setShowPasswordFallback(true)
-          if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
         } else {
           setError(`Verification failed (${nr}/${MAX_RETRIES}). Try again.`)
           setStatus('idle')
           setMessage('Start verification to compare your face.')
-          if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
         }
       }
     } catch {
-      console.error('[Verify] Verification request error')
       setError('Verification request failed.')
       setStatus('error')
-      if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null }
     }
   }, [retries, router])
 
@@ -526,7 +496,6 @@ export default function VerifyPage() {
             <p className="text-muted-foreground">{message}</p>
           </div>
 
-          {/* Error message */}
           {error && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20 mb-6">
               <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
@@ -534,7 +503,6 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Success message */}
           {status === 'success' && (
             <div className="flex items-center gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 mb-6">
               <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
@@ -542,7 +510,6 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Confidence badge */}
           {(status === 'detecting' || status === 'camera') && faceDetected && confidence > 0 && (
             <div className="text-center mb-2">
               <span className="px-3 py-1.5 rounded-full text-xs font-medium bg-primary/20 text-primary border border-primary/30">
@@ -551,7 +518,7 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Camera Preview – ALWAYS mounted */}
+          {/* Camera Preview – ALWAYS mounted, controlled by isActive */}
           <CameraPreview
             isActive={status === 'camera' || status === 'detecting' || status === 'verifying'}
             modelsReady={modelsReady}
@@ -564,14 +531,12 @@ export default function VerifyPage() {
             onVerifyFace={handleVerifyFace}
           />
 
-          {/* Retries info */}
           {status === 'error' && retries < MAX_RETRIES && (
             <div className="text-center mb-4">
               <span className="text-sm text-amber-400">{MAX_RETRIES - retries} retries remaining</span>
             </div>
           )}
 
-          {/* Password fallback */}
           {showPasswordFallback && (
             <div className="space-y-4 mb-6">
               <div className="flex items-center gap-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
@@ -596,7 +561,6 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Action buttons */}
           {!showPasswordFallback && (
             <div className="flex gap-3">
               {status === 'idle' && (
@@ -620,7 +584,6 @@ export default function VerifyPage() {
             </div>
           )}
 
-          {/* Navigation */}
           <div className="mt-6 flex items-center justify-between">
             <Link href="/dashboard" className="text-sm text-muted-foreground hover:text-primary transition-colors">Back to Dashboard</Link>
             <Link href="/settings" className="text-sm text-muted-foreground hover:text-primary transition-colors">Security Settings</Link>

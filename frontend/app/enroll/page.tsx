@@ -57,24 +57,17 @@ function CameraPreview({
   useEffect(() => { onFaceDetectedRef.current = onFaceDetected }, [onFaceDetected])
   useEffect(() => { onCameraReadyRef.current = onCameraReady }, [onCameraReady])
 
-  // Mounted tracking – guards async callbacks against post-unmount state writes
+  // Mounted tracking – set true on mount, false on REAL unmount
   useEffect(() => {
     mountedRef.current = true
-    return () => { mountedRef.current = false }
-  }, [])
-
-  /* ---------------------------------------------------------------- */
-  /*  stopStream – safely tear down the current MediaStream            */
-  /* ---------------------------------------------------------------- */
-  const stopStream = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
-    const video = videoRef.current
-    if (video) {
-      video.srcObject = null
-      video.load() // release any pending decode
+    return () => {
+      mountedRef.current = false
+      // NOTE: We intentionally do NOT reset startingRef here.
+      // React 18 StrictMode runs: mount → cleanup → mount.
+      // If we reset startingRef, the second mount would start a duplicate
+      // camera request, creating two concurrent getUserMedia calls that
+      // fight over the same video element. Instead, we let the first
+      // startCamera() continue and reset startingRef only on bail-out paths.
     }
   }, [])
 
@@ -115,8 +108,14 @@ function CameraPreview({
     console.log('[CameraPreview] Starting camera...')
     setErrorMsg('')
 
-    /* ---- stop any previous stream ---- */
-    stopStream()
+    /* ---- stop any PREVIOUS stream (only if one exists) ---- */
+    if (streamRef.current) {
+      console.log('[CameraPreview] Stopping existing stream before starting new one')
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+      const v = videoRef.current
+      if (v) v.srcObject = null
+    }
 
     /* ---- set state to "starting" (shows loading overlay) ---- */
     if (mountedRef.current) setCameraState('starting')
@@ -131,6 +130,7 @@ function CameraPreview({
       /* Bail out if component unmounted while waiting for permission */
       if (!mountedRef.current) {
         stream.getTracks().forEach(t => t.stop())
+        startingRef.current = false // allow future mount to start
         return
       }
 
@@ -158,61 +158,67 @@ function CameraPreview({
 
       /* 4. Assign stream */
       video.srcObject = stream
-      console.log('[CameraPreview] srcObject assigned')
+      console.log('[CameraPreview] srcObject assigned, waiting for video data...')
 
-      /* 5. Wait for actual video data (loadeddata ≥ HAVE_CURRENT_DATA) */
+      /* 5. Wait for actual video data using polling + events
+       *    We use polling as the primary mechanism because event listeners
+       *    can be unreliable when added after srcObject assignment. */
       await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Camera initialization timed out. Please try again.')), 15_000)
+        const deadline = setTimeout(() => {
+          clearInterval(poll)
+          reject(new Error('Camera initialization timed out. Please try again.'))
+        }, 15_000)
 
-        if (video.readyState >= 2) {
-          clearTimeout(timeout)
+        let resolved = false
+        const done = () => {
+          if (resolved) return
+          resolved = true
+          clearTimeout(deadline)
+          clearInterval(poll)
           resolve()
-          return
         }
 
-        const done = () => { clearTimeout(timeout); resolve() }
-        const fail = () => { clearTimeout(timeout); reject(new Error('Video element encountered an error.')) }
+        // Poll every 50ms – catches cases where events already fired
+        const poll = setInterval(() => {
+          if (video.readyState >= 2 && video.videoWidth > 0) done()
+        }, 50)
 
-        video.addEventListener('loadeddata', done, { once: true })
-        video.addEventListener('error', fail, { once: true })
+        // Also listen for events as a faster path
+        video.addEventListener('loadeddata', () => done(), { once: true })
+        video.addEventListener('error', () => {
+          if (!resolved) { clearTimeout(deadline); clearInterval(poll); reject(new Error('Video element error.')) }
+        }, { once: true })
+
+        // Immediate check in case data is already available
+        if (video.readyState >= 2 && video.videoWidth > 0) done()
       })
 
-      if (!mountedRef.current) return
+      if (!mountedRef.current) {
+        startingRef.current = false
+        return
+      }
 
-      /* 6. Explicitly play (with retry) */
+      /* 6. Explicitly play */
       try {
         await video.play()
         console.log('[CameraPreview] play() succeeded')
       } catch (playErr) {
-        console.warn('[CameraPreview] play() rejected on first attempt:', playErr)
-        // Retry once – sometimes the browser needs a second attempt after loadeddata
-        await new Promise(r => setTimeout(r, 100))
+        console.warn('[CameraPreview] play() rejected:', playErr)
+        // Retry after a short delay
+        await new Promise(r => setTimeout(r, 150))
         try {
           await video.play()
           console.log('[CameraPreview] play() succeeded on retry')
         } catch {
-          // If still failing but video has data, continue – the stream may still render
           if (video.readyState < 2) throw new Error('Video playback failed – no data available.')
           console.log('[CameraPreview] Continuing despite play() rejection (readyState OK)')
         }
       }
 
-      /* 7. Wait for real video dimensions (non-zero) */
-      if (video.videoWidth === 0 || video.videoHeight === 0) {
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error('Camera produced no video frames.')), 5_000)
-          const check = () => {
-            if (video.videoWidth > 0 && video.videoHeight > 0) {
-              clearTimeout(timeout)
-              resolve()
-            }
-          }
-          video.addEventListener('resize', () => check(), { once: true })
-          check()
-        })
+      if (!mountedRef.current) {
+        startingRef.current = false
+        return
       }
-
-      if (!mountedRef.current) return
 
       console.log('[CameraPreview] Camera ready!', video.videoWidth, 'x', video.videoHeight)
       setCameraState('ready')
@@ -220,22 +226,32 @@ function CameraPreview({
       startingRef.current = false
       startFaceDetection()
     } catch (err: unknown) {
-      if (!mountedRef.current) { startingRef.current = false; return }
+      if (!mountedRef.current) {
+        startingRef.current = false // allow future mount to start
+        return
+      }
 
       console.error('[CameraPreview] Camera error:', err)
       startingRef.current = false
-      stopStream()
+
+      // Clean up failed stream
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+      }
+      const v = videoRef.current
+      if (v) v.srcObject = null
 
       const e = err as Error
       if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied. Please allow camera access in your browser settings and try again.')
       else if (e.name === 'NotFoundError') setErrorMsg('No camera found on this device.')
-      else if (e.name === 'NotReadableError') setErrorMsg('Camera is in use by another application. Close other apps using the camera.')
+      else if (e.name === 'NotReadableError') setErrorMsg('Camera is in use by another application.')
       else setErrorMsg(e.message || 'Failed to start camera.')
 
       setCameraState('error')
       onCameraReadyRef.current(null, null)
     }
-  }, [modelsReady, stopStream, startFaceDetection])
+  }, [modelsReady, startFaceDetection])
 
   /* ---------------------------------------------------------------- */
   /*  stopCamera – full teardown                                       */
@@ -249,13 +265,18 @@ function CameraPreview({
       detectionRef.current = null
     }
 
-    stopStream()
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
+    const video = videoRef.current
+    if (video) video.srcObject = null
 
     setCameraState('idle')
     setErrorMsg('')
     onCameraReadyRef.current(null, null)
     onFaceDetectedRef.current(false, 0)
-  }, [stopStream])
+  }, [])
 
   /* ---------------------------------------------------------------- */
   /*  Auto-start / auto-stop effect                                    */
@@ -273,13 +294,10 @@ function CameraPreview({
   }, [isActive, cameraState, modelsReady, startCamera, stopCamera])
 
   /* ---------------------------------------------------------------- */
-  /*  Cleanup on unmount – stop stream & reset guards                  */
+  /*  Cleanup on unmount – stop stream (but do NOT reset startingRef)  */
   /* ---------------------------------------------------------------- */
   useEffect(() => {
     return () => {
-      console.log('[CameraPreview] Unmounting – full cleanup')
-      startingRef.current = false
-      mountedRef.current = false
       if (detectionRef.current) clearInterval(detectionRef.current)
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(t => t.stop())
@@ -352,7 +370,6 @@ function CameraPreview({
 
       {/* Action buttons */}
       <div className="flex gap-3">
-        {/* Manual start button – shown when auto-start didn't fire */}
         {cameraState === 'idle' && isActive && (
           <button
             onClick={startCamera}
@@ -363,7 +380,6 @@ function CameraPreview({
           </button>
         )}
 
-        {/* Primary action button – only when camera is live */}
         {cameraState === 'ready' && primaryButton && (
           <button
             onClick={primaryButton.onClick}
@@ -374,7 +390,6 @@ function CameraPreview({
           </button>
         )}
 
-        {/* Secondary action button */}
         {cameraState === 'ready' && secondaryButton && (
           <button onClick={secondaryButton.onClick} className="w-full btn-secondary">
             {secondaryButton.label}
@@ -402,6 +417,7 @@ export default function EnrollPage() {
   const [success, setSuccess] = useState(false)
   const [confidence, setConfidence] = useState(0)
   const [modelsReady, setModelsReady] = useState(false)
+  const [modelsError, setModelsError] = useState(false)
 
   const captureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -419,6 +435,7 @@ export default function EnrollPage() {
         console.log('[Enroll] Models loaded successfully')
       } catch (err) {
         console.error('[Enroll] Model load failed:', err)
+        setModelsError(true)
         setError('Failed to load face detection models. Please refresh the page.')
       }
     }
@@ -426,9 +443,8 @@ export default function EnrollPage() {
 
     return () => {
       if (captureTimerRef.current) clearTimeout(captureTimerRef.current)
-      if (cameraStream) cameraStream.getTracks().forEach(t => t.stop())
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
   /* Handle camera ready state from CameraPreview */
   const handleCameraReady = useCallback((video: HTMLVideoElement | null, stream: MediaStream | null) => {
@@ -443,42 +459,6 @@ export default function EnrollPage() {
     setFaceDetected(detected)
     setConfidence(score)
   }, [])
-
-  /* Capture a single face sample */
-  const captureSample = useCallback(async () => {
-    if (!videoEl || videoEl.readyState < 2) {
-      setError('Camera preview not ready.')
-      return
-    }
-
-    console.log('[Enroll] Capturing sample', captureCount + 1)
-    try {
-      const canvas = document.createElement('canvas')
-      canvas.width = videoEl.videoWidth
-      canvas.height = videoEl.videoHeight
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-
-      // Mirror the capture to match the displayed preview
-      ctx.translate(canvas.width, 0)
-      ctx.scale(-1, 1)
-      ctx.drawImage(videoEl, 0, 0)
-
-      const imageData = canvas.toDataURL('image/jpeg', 0.85)
-      const newCount = captureCount + 1
-      setCaptureCount(newCount)
-      console.log('[Enroll] Sample', newCount, '/ 5 captured')
-
-      if (newCount >= 5) {
-        console.log('[Enroll] All 5 samples done, processing enrollment')
-        setCurrentStep(4)
-        await processEnrollment(imageData)
-      }
-    } catch (err) {
-      console.error('[Enroll] Capture error:', err)
-      setError('Failed to capture face sample.')
-    }
-  }, [videoEl, captureCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /* Process enrollment with the final captured image */
   const processEnrollment = useCallback(async (finalImage: string) => {
@@ -497,7 +477,6 @@ export default function EnrollPage() {
         return
       }
 
-      console.log('[Enroll] Face detected, score:', det.detection.score)
       const embedding = Array.from(det.descriptor)
       const userId = sessionStorage.getItem('signupUserId') || sessionStorage.getItem('userId') || ''
       const username = sessionStorage.getItem('signupUsername') || sessionStorage.getItem('user') || ''
@@ -527,6 +506,39 @@ export default function EnrollPage() {
     }
   }, [])
 
+  /* Capture a single face sample */
+  const captureSample = useCallback(async () => {
+    if (!videoEl || videoEl.readyState < 2) {
+      setError('Camera preview not ready.')
+      return
+    }
+
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = videoEl.videoWidth
+      canvas.height = videoEl.videoHeight
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+
+      ctx.translate(canvas.width, 0)
+      ctx.scale(-1, 1)
+      ctx.drawImage(videoEl, 0, 0)
+
+      const imageData = canvas.toDataURL('image/jpeg', 0.85)
+      const newCount = captureCount + 1
+      setCaptureCount(newCount)
+      console.log('[Enroll] Sample', newCount, '/ 5 captured')
+
+      if (newCount >= 5) {
+        setCurrentStep(4)
+        await processEnrollment(imageData)
+      }
+    } catch (err) {
+      console.error('[Enroll] Capture error:', err)
+      setError('Failed to capture face sample.')
+    }
+  }, [videoEl, captureCount, processEnrollment])
+
   /* Auto-capture on step 3 */
   useEffect(() => {
     if (captureTimerRef.current) {
@@ -536,9 +548,7 @@ export default function EnrollPage() {
 
     if (currentStep === 3 && cameraReady && faceDetected && !processing) {
       console.log('[Enroll] Auto-capturing in 1.5s...')
-      captureTimerRef.current = setTimeout(() => {
-        captureSample()
-      }, 1500)
+      captureTimerRef.current = setTimeout(() => captureSample(), 1500)
     }
 
     return () => {
@@ -550,230 +560,7 @@ export default function EnrollPage() {
   }, [currentStep, cameraReady, faceDetected, processing, captureSample])
 
   /* ---- Step renderer ---- */
-  const renderStep = () => {
-    const step = STEPS[currentStep]
-
-    return (
-      <div className="space-y-8">
-        {/* Step indicator */}
-        <div className="flex items-center justify-between mb-8">
-          {STEPS.map((s, i) => (
-            <div key={s.id} className="flex items-center">
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-all ${
-                i < currentStep ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
-                i === currentStep ? 'bg-primary/20 text-primary border border-primary/30' :
-                'bg-secondary text-muted-foreground border border-border'
-              }`}>
-                {i < currentStep ? <CheckCircle className="w-4 h-4" /> : i + 1}
-              </div>
-              {i < STEPS.length - 1 && (
-                <div className={`w-8 h-0.5 transition-all ${i < currentStep ? 'bg-emerald-500/30' : 'bg-border'}`} />
-              )}
-            </div>
-          ))}
-        </div>
-
-        {/* Title */}
-        <div className="text-center">
-          <h2 className="text-2xl font-bold text-foreground mb-2">{step.title}</h2>
-          <p className="text-muted-foreground">{step.desc}</p>
-        </div>
-
-        {/* Error */}
-        {error && (
-          <div className="flex items-center gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20">
-            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-            <p className="text-sm text-red-400">{error}</p>
-          </div>
-        )}
-
-        {/* Success */}
-        {success && (
-          <div className="flex items-center gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-            <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-            <p className="text-sm text-emerald-400">Face enrollment complete!</p>
-          </div>
-        )}
-
-        {/* Step 0: Intro */}
-        {currentStep === 0 && (
-          <div className="space-y-6">
-            <div className="flex justify-center">
-              <div className="w-24 h-24 rounded-2xl bg-primary/10 flex items-center justify-center">
-                <Fingerprint className="w-12 h-12 text-primary" />
-              </div>
-            </div>
-            <div className="glass rounded-xl p-6 space-y-4">
-              <h3 className="text-lg font-semibold text-foreground">What to expect</h3>
-              <ul className="space-y-3 text-sm text-muted-foreground">
-                <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Allow camera access</li>
-                <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Position your face in the frame</li>
-                <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />We will capture 5 face samples</li>
-                <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Create your biometric profile</li>
-              </ul>
-            </div>
-            <button onClick={() => setCurrentStep(1)} className="w-full btn-primary">
-              Continue <ArrowRight className="w-5 h-5 ml-2" />
-            </button>
-          </div>
-        )}
-
-        {/* Step 1: Permission */}
-        {currentStep === 1 && (
-          <div className="space-y-6">
-            <div className="flex justify-center">
-              <div className="w-24 h-24 rounded-2xl bg-primary/10 flex items-center justify-center">
-                <Camera className="w-12 h-12 text-primary" />
-              </div>
-            </div>
-            <div className="glass rounded-xl p-6">
-              <h3 className="text-lg font-semibold text-foreground mb-2">Camera Permission Required</h3>
-              <p className="text-sm text-muted-foreground mb-4">
-                We need access to your camera to capture your face for biometric enrollment.
-                Your face data is processed locally and stored securely.
-              </p>
-              <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                <Shield className="w-4 h-4 text-amber-400 shrink-0" />
-                <p className="text-xs text-amber-400">Your biometric data is never shared or sold.</p>
-              </div>
-            </div>
-            <div className="flex gap-3">
-              <button onClick={() => setCurrentStep(0)} className="btn-ghost flex-1">
-                <ArrowLeft className="w-4 h-4 mr-2" /> Back
-              </button>
-              <button
-                onClick={() => setCurrentStep(2)}
-                disabled={!modelsReady}
-                className="btn-primary flex-1 disabled:opacity-50"
-              >
-                {modelsReady ? 'Allow Camera' : 'Loading Models...'} <ArrowRight className="w-5 h-5 ml-2" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Steps 2 & 3: Camera */}
-        {(currentStep === 2 || currentStep === 3) && (
-          <div className="space-y-6">
-            <CameraPreview
-              isActive={true}
-              modelsReady={modelsReady}
-              onCameraReady={handleCameraReady}
-              onFaceDetected={handleFaceDetected}
-              overlay={
-                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                  {/* Face detection oval */}
-                  <div className={`w-48 h-60 border-2 rounded-full transition-all mb-16 ${
-                    faceDetected ? 'border-emerald-500/70' : 'border-white/30 animate-pulse'
-                  }`} />
-                  {/* Status badges */}
-                  <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between pointer-events-auto">
-                    <div className={`px-3 py-1.5 rounded-full text-xs font-medium ${
-                      faceDetected ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
-                    }`}>
-                      {faceDetected ? 'Face Detected' : 'No Face Detected'}
-                    </div>
-                    {faceDetected && (
-                      <div className="px-3 py-1.5 rounded-full text-xs font-medium bg-primary/20 text-primary border border-primary/30">
-                        {Math.round(confidence * 100)}%
-                      </div>
-                    )}
-                    {currentStep === 3 && (
-                      <div className="px-3 py-1.5 rounded-full text-xs font-medium bg-primary/20 text-primary border border-primary/30">
-                        {captureCount}/5
-                      </div>
-                    )}
-                  </div>
-                </div>
-              }
-              primaryButton={currentStep === 2 ? {
-                label: 'Continue to Capture',
-                onClick: () => {
-                  if (faceDetected) {
-                    setCurrentStep(3)
-                    setCaptureCount(0)
-                    setFaceDetected(false)
-                    setConfidence(0)
-                  } else {
-                    setError('Please position your face in the frame first.')
-                  }
-                },
-                disabled: !faceDetected,
-              } : undefined}
-              secondaryButton={currentStep === 2 ? {
-                label: 'Close Camera',
-                onClick: () => setCurrentStep(1),
-              } : undefined}
-            />
-
-            {/* Step 2 instructions */}
-            {currentStep === 2 && cameraReady && (
-              <div className="glass rounded-xl p-6">
-                <h3 className="text-lg font-semibold text-foreground mb-3">Position your face</h3>
-                <ul className="space-y-2 text-sm text-muted-foreground">
-                  <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Ensure good lighting</li>
-                  <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Look directly at the camera</li>
-                  <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Keep still while detecting</li>
-                </ul>
-              </div>
-            )}
-
-            {/* Step 3 progress */}
-            {currentStep === 3 && cameraReady && (
-              <>
-                <div className="space-y-2">
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm font-medium text-foreground">Capturing samples</span>
-                    <span className="text-sm text-muted-foreground">{captureCount}/5</span>
-                  </div>
-                  <div className="w-full bg-secondary rounded-full h-2 overflow-hidden">
-                    <div
-                      className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
-                      style={{ width: `${(captureCount / 5) * 100}%` }}
-                    />
-                  </div>
-                </div>
-                <div className="glass rounded-xl p-4">
-                  <p className="text-sm text-muted-foreground text-center">
-                    {faceDetected ? '✓ Capturing...' : 'Position your face in the frame'}
-                  </p>
-                </div>
-              </>
-            )}
-          </div>
-        )}
-
-        {/* Step 4: Processing */}
-        {currentStep === 4 && (
-          <div className="space-y-8 flex flex-col items-center justify-center py-12">
-            <div className="w-24 h-24 rounded-2xl bg-primary/10 flex items-center justify-center">
-              {processing ? <Loader2 className="w-12 h-12 text-primary animate-spin" /> : <Fingerprint className="w-12 h-12 text-primary" />}
-            </div>
-            <div className="text-center">
-              <h3 className="text-lg font-semibold text-foreground mb-2">Processing...</h3>
-              <p className="text-sm text-muted-foreground">Creating your biometric profile.</p>
-            </div>
-          </div>
-        )}
-
-        {/* Step 5: Complete */}
-        {currentStep === 5 && (
-          <div className="space-y-8 flex flex-col items-center justify-center py-12">
-            <div className="w-24 h-24 rounded-2xl bg-emerald-500/10 flex items-center justify-center">
-              <CheckCircle className="w-12 h-12 text-emerald-400" />
-            </div>
-            <div className="text-center">
-              <h3 className="text-lg font-semibold text-foreground mb-2">Enrollment Complete!</h3>
-              <p className="text-sm text-muted-foreground mb-6">Your face has been enrolled successfully.</p>
-            </div>
-            <button onClick={() => router.push('/dashboard')} className="btn-primary">
-              Go to Dashboard <ArrowRight className="w-5 h-5 ml-2" />
-            </button>
-          </div>
-        )}
-      </div>
-    )
-  }
+  const step = STEPS[currentStep]
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center px-4 py-12">
@@ -788,7 +575,222 @@ export default function EnrollPage() {
             <span className="text-xl font-bold text-gradient">Za-Biometrie</span>
           </Link>
         </div>
-        <div className="glass rounded-2xl p-8 shadow-glow">{renderStep()}</div>
+        <div className="glass rounded-2xl p-8 shadow-glow">
+          <div className="space-y-8">
+            {/* Step indicator */}
+            <div className="flex items-center justify-between mb-8">
+              {STEPS.map((s, i) => (
+                <div key={s.id} className="flex items-center">
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-all ${
+                    i < currentStep ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
+                    i === currentStep ? 'bg-primary/20 text-primary border border-primary/30' :
+                    'bg-secondary text-muted-foreground border border-border'
+                  }`}>
+                    {i < currentStep ? <CheckCircle className="w-4 h-4" /> : i + 1}
+                  </div>
+                  {i < STEPS.length - 1 && (
+                    <div className={`w-8 h-0.5 transition-all ${i < currentStep ? 'bg-emerald-500/30' : 'bg-border'}`} />
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Title */}
+            <div className="text-center">
+              <h2 className="text-2xl font-bold text-foreground mb-2">{step.title}</h2>
+              <p className="text-muted-foreground">{step.desc}</p>
+            </div>
+
+            {/* Error */}
+            {error && (
+              <div className="flex items-center gap-2 p-3 rounded-xl bg-red-500/10 border border-red-500/20">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                <p className="text-sm text-red-400">{error}</p>
+              </div>
+            )}
+
+            {/* Success */}
+            {success && (
+              <div className="flex items-center gap-2 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
+                <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                <p className="text-sm text-emerald-400">Face enrollment complete!</p>
+              </div>
+            )}
+
+            {/* ======== Step 0: Intro ======== */}
+            {currentStep === 0 && (
+              <div className="space-y-6">
+                <div className="flex justify-center">
+                  <div className="w-24 h-24 rounded-2xl bg-primary/10 flex items-center justify-center">
+                    <Fingerprint className="w-12 h-12 text-primary" />
+                  </div>
+                </div>
+                <div className="glass rounded-xl p-6 space-y-4">
+                  <h3 className="text-lg font-semibold text-foreground">What to expect</h3>
+                  <ul className="space-y-3 text-sm text-muted-foreground">
+                    <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Allow camera access</li>
+                    <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Position your face in the frame</li>
+                    <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />We will capture 5 face samples</li>
+                    <li className="flex items-center gap-3"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Create your biometric profile</li>
+                  </ul>
+                </div>
+                <button onClick={() => setCurrentStep(1)} className="w-full btn-primary">
+                  Continue <ArrowRight className="w-5 h-5 ml-2" />
+                </button>
+              </div>
+            )}
+
+            {/* ======== Step 1: Permission ======== */}
+            {currentStep === 1 && (
+              <div className="space-y-6">
+                <div className="flex justify-center">
+                  <div className="w-24 h-24 rounded-2xl bg-primary/10 flex items-center justify-center">
+                    <Camera className="w-12 h-12 text-primary" />
+                  </div>
+                </div>
+                <div className="glass rounded-xl p-6">
+                  <h3 className="text-lg font-semibold text-foreground mb-2">Camera Permission Required</h3>
+                  <p className="text-sm text-muted-foreground mb-4">
+                    We need access to your camera to capture your face for biometric enrollment.
+                    Your face data is processed locally and stored securely.
+                  </p>
+                  <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
+                    <Shield className="w-4 h-4 text-amber-400 shrink-0" />
+                    <p className="text-xs text-amber-400">Your biometric data is never shared or sold.</p>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={() => setCurrentStep(0)} className="btn-ghost flex-1">
+                    <ArrowLeft className="w-4 h-4 mr-2" /> Back
+                  </button>
+                  <button
+                    onClick={() => setCurrentStep(2)}
+                    disabled={!modelsReady}
+                    className="btn-primary flex-1 disabled:opacity-50"
+                  >
+                    {modelsReady ? 'Allow Camera' : 'Loading Models...'} <ArrowRight className="w-5 h-5 ml-2" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* ======== Steps 2 & 3: Camera ======== */}
+            {(currentStep === 2 || currentStep === 3) && (
+              <div className="space-y-6">
+                <CameraPreview
+                  isActive={true}
+                  modelsReady={modelsReady}
+                  onCameraReady={handleCameraReady}
+                  onFaceDetected={handleFaceDetected}
+                  overlay={
+                    <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                      <div className={`w-48 h-60 border-2 rounded-full transition-all mb-16 ${
+                        faceDetected ? 'border-emerald-500/70' : 'border-white/30 animate-pulse'
+                      }`} />
+                      <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between pointer-events-auto">
+                        <div className={`px-3 py-1.5 rounded-full text-xs font-medium ${
+                          faceDetected ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
+                        }`}>
+                          {faceDetected ? 'Face Detected' : 'No Face Detected'}
+                        </div>
+                        {faceDetected && (
+                          <div className="px-3 py-1.5 rounded-full text-xs font-medium bg-primary/20 text-primary border border-primary/30">
+                            {Math.round(confidence * 100)}%
+                          </div>
+                        )}
+                        {currentStep === 3 && (
+                          <div className="px-3 py-1.5 rounded-full text-xs font-medium bg-primary/20 text-primary border border-primary/30">
+                            {captureCount}/5
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  }
+                  primaryButton={currentStep === 2 ? {
+                    label: 'Continue to Capture',
+                    onClick: () => {
+                      if (faceDetected) {
+                        setCurrentStep(3)
+                        setCaptureCount(0)
+                        setFaceDetected(false)
+                        setConfidence(0)
+                      } else {
+                        setError('Please position your face in the frame first.')
+                      }
+                    },
+                    disabled: !faceDetected,
+                  } : undefined}
+                  secondaryButton={currentStep === 2 ? {
+                    label: 'Close Camera',
+                    onClick: () => setCurrentStep(1),
+                  } : undefined}
+                />
+
+                {currentStep === 2 && cameraReady && (
+                  <div className="glass rounded-xl p-6">
+                    <h3 className="text-lg font-semibold text-foreground mb-3">Position your face</h3>
+                    <ul className="space-y-2 text-sm text-muted-foreground">
+                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Ensure good lighting</li>
+                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Look directly at the camera</li>
+                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />Keep still while detecting</li>
+                    </ul>
+                  </div>
+                )}
+
+                {currentStep === 3 && cameraReady && (
+                  <>
+                    <div className="space-y-2">
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm font-medium text-foreground">Capturing samples</span>
+                        <span className="text-sm text-muted-foreground">{captureCount}/5</span>
+                      </div>
+                      <div className="w-full bg-secondary rounded-full h-2 overflow-hidden">
+                        <div
+                          className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
+                          style={{ width: `${(captureCount / 5) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                    <div className="glass rounded-xl p-4">
+                      <p className="text-sm text-muted-foreground text-center">
+                        {faceDetected ? '✓ Capturing...' : 'Position your face in the frame'}
+                      </p>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* ======== Step 4: Processing ======== */}
+            {currentStep === 4 && (
+              <div className="space-y-8 flex flex-col items-center justify-center py-12">
+                <div className="w-24 h-24 rounded-2xl bg-primary/10 flex items-center justify-center">
+                  {processing ? <Loader2 className="w-12 h-12 text-primary animate-spin" /> : <Fingerprint className="w-12 h-12 text-primary" />}
+                </div>
+                <div className="text-center">
+                  <h3 className="text-lg font-semibold text-foreground mb-2">Processing...</h3>
+                  <p className="text-sm text-muted-foreground">Creating your biometric profile.</p>
+                </div>
+              </div>
+            )}
+
+            {/* ======== Step 5: Complete ======== */}
+            {currentStep === 5 && (
+              <div className="space-y-8 flex flex-col items-center justify-center py-12">
+                <div className="w-24 h-24 rounded-2xl bg-emerald-500/10 flex items-center justify-center">
+                  <CheckCircle className="w-12 h-12 text-emerald-400" />
+                </div>
+                <div className="text-center">
+                  <h3 className="text-lg font-semibold text-foreground mb-2">Enrollment Complete!</h3>
+                  <p className="text-sm text-muted-foreground mb-6">Your face has been enrolled successfully.</p>
+                </div>
+                <button onClick={() => router.push('/dashboard')} className="btn-primary">
+                  Go to Dashboard <ArrowRight className="w-5 h-5 ml-2" />
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   )
