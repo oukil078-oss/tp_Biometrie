@@ -21,409 +21,37 @@ const STEPS = [
 const MODEL_URL = typeof window !== 'undefined' ? `${window.location.origin}/models` : '/models'
 
 /* ------------------------------------------------------------------ */
-/*  Camera Preview Component                                           */
-/* ------------------------------------------------------------------ */
-
-interface CameraPreviewProps {
-  isActive: boolean
-  modelsReady: boolean
-  onCameraReady: (videoEl: HTMLVideoElement | null, stream: MediaStream | null) => void
-  onFaceDetected: (detected: boolean, score: number) => void
-  overlay?: React.ReactNode
-  primaryButton?: { label: string; onClick: () => void; disabled?: boolean }
-  secondaryButton?: { label: string; onClick: () => void }
-}
-
-function CameraPreview({
-  isActive,
-  modelsReady,
-  onCameraReady,
-  onFaceDetected,
-  overlay,
-  primaryButton,
-  secondaryButton,
-}: CameraPreviewProps) {
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const streamRef = useRef<MediaStream | null>(null)
-  const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const mountedRef = useRef(true)
-  const startingRef = useRef(false)
-  const [cameraState, setCameraState] = useState<'idle' | 'starting' | 'ready' | 'error'>('idle')
-  const [errorMsg, setErrorMsg] = useState('')
-  const onFaceDetectedRef = useRef(onFaceDetected)
-  const onCameraReadyRef = useRef(onCameraReady)
-
-  // Keep refs updated without causing re-renders of effects
-  useEffect(() => { onFaceDetectedRef.current = onFaceDetected }, [onFaceDetected])
-  useEffect(() => { onCameraReadyRef.current = onCameraReady }, [onCameraReady])
-
-  // Mounted tracking – set true on mount, false on REAL unmount
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-      // NOTE: We intentionally do NOT reset startingRef here.
-      // React 18 StrictMode runs: mount → cleanup → mount.
-      // If we reset startingRef, the second mount would start a duplicate
-      // camera request, creating two concurrent getUserMedia calls that
-      // fight over the same video element. Instead, we let the first
-      // startCamera() continue and reset startingRef only on bail-out paths.
-    }
-  }, [])
-
-  /* ---------------------------------------------------------------- */
-  /*  startFaceDetection – periodic single-face detection loop         */
-  /* ---------------------------------------------------------------- */
-  const startFaceDetection = useCallback(() => {
-    if (detectionRef.current) {
-      clearInterval(detectionRef.current)
-      detectionRef.current = null
-    }
-
-    console.log('[CameraPreview] Starting face detection loop')
-    detectionRef.current = setInterval(async () => {
-      const video = videoRef.current
-      if (!video || video.readyState < 2) return
-      try {
-        const det = await faceapi.detectSingleFace(video)
-        onFaceDetectedRef.current(!!det, det?.score ?? 0)
-      } catch {
-        onFaceDetectedRef.current(false, 0)
-      }
-    }, 500)
-  }, [])
-
-  /* ---------------------------------------------------------------- */
-  /*  startCamera – obtain MediaStream & bind it to <video>            */
-  /* ---------------------------------------------------------------- */
-  const startCamera = useCallback(async () => {
-    /* ---- guards ---- */
-    if (startingRef.current) return
-    if (!modelsReady) {
-      console.log('[CameraPreview] Models not ready yet, skipping start')
-      return
-    }
-
-    startingRef.current = true
-    console.log('[CameraPreview] Starting camera...')
-    setErrorMsg('')
-
-    /* ---- stop any PREVIOUS stream (only if one exists) ---- */
-    if (streamRef.current) {
-      console.log('[CameraPreview] Stopping existing stream before starting new one')
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-      const v = videoRef.current
-      if (v) v.srcObject = null
-    }
-
-    /* ---- set state to "starting" (shows loading overlay) ---- */
-    if (mountedRef.current) setCameraState('starting')
-
-    try {
-      /* 1. Request camera */
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-        audio: false,
-      })
-
-      /* Bail out if component unmounted while waiting for permission */
-      if (!mountedRef.current) {
-        stream.getTracks().forEach(t => t.stop())
-        startingRef.current = false // allow future mount to start
-        return
-      }
-
-      /* Validate stream has video tracks */
-      if (stream.getVideoTracks().length === 0) {
-        stream.getTracks().forEach(t => t.stop())
-        throw new Error('No video tracks found in camera stream.')
-      }
-
-      streamRef.current = stream
-      console.log('[CameraPreview] Stream obtained:', stream.id, 'tracks:', stream.getTracks().length)
-
-      /* 2. Grab video element */
-      const video = videoRef.current
-      if (!video) {
-        stream.getTracks().forEach(t => t.stop())
-        streamRef.current = null
-        throw new Error('Video element not found in DOM.')
-      }
-
-      /* 3. Set playback attributes BEFORE assigning srcObject */
-      video.muted = true
-      video.autoplay = true
-      video.playsInline = true
-
-      /* 4. Assign stream */
-      video.srcObject = stream
-      console.log('[CameraPreview] srcObject assigned, waiting for video data...')
-
-      /* 5. Wait for actual video data using polling + events
-       *    We use polling as the primary mechanism because event listeners
-       *    can be unreliable when added after srcObject assignment. */
-      await new Promise<void>((resolve, reject) => {
-        const deadline = setTimeout(() => {
-          clearInterval(poll)
-          reject(new Error('Camera initialization timed out. Please try again.'))
-        }, 15_000)
-
-        let resolved = false
-        const done = () => {
-          if (resolved) return
-          resolved = true
-          clearTimeout(deadline)
-          clearInterval(poll)
-          resolve()
-        }
-
-        // Poll every 50ms – catches cases where events already fired
-        const poll = setInterval(() => {
-          if (video.readyState >= 2 && video.videoWidth > 0) done()
-        }, 50)
-
-        // Also listen for events as a faster path
-        video.addEventListener('loadeddata', () => done(), { once: true })
-        video.addEventListener('error', () => {
-          if (!resolved) { clearTimeout(deadline); clearInterval(poll); reject(new Error('Video element error.')) }
-        }, { once: true })
-
-        // Immediate check in case data is already available
-        if (video.readyState >= 2 && video.videoWidth > 0) done()
-      })
-
-      if (!mountedRef.current) {
-        startingRef.current = false
-        return
-      }
-
-      /* 6. Explicitly play */
-      try {
-        await video.play()
-        console.log('[CameraPreview] play() succeeded')
-      } catch (playErr) {
-        console.warn('[CameraPreview] play() rejected:', playErr)
-        // Retry after a short delay
-        await new Promise(r => setTimeout(r, 150))
-        try {
-          await video.play()
-          console.log('[CameraPreview] play() succeeded on retry')
-        } catch {
-          if (video.readyState < 2) throw new Error('Video playback failed – no data available.')
-          console.log('[CameraPreview] Continuing despite play() rejection (readyState OK)')
-        }
-      }
-
-      if (!mountedRef.current) {
-        startingRef.current = false
-        return
-      }
-
-      console.log('[CameraPreview] Camera ready!', video.videoWidth, 'x', video.videoHeight)
-      setCameraState('ready')
-      onCameraReadyRef.current(video, streamRef.current)
-      startingRef.current = false
-      startFaceDetection()
-    } catch (err: unknown) {
-      if (!mountedRef.current) {
-        startingRef.current = false // allow future mount to start
-        return
-      }
-
-      console.error('[CameraPreview] Camera error:', err)
-      startingRef.current = false
-
-      // Clean up failed stream
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop())
-        streamRef.current = null
-      }
-      const v = videoRef.current
-      if (v) v.srcObject = null
-
-      const e = err as Error
-      if (e.name === 'NotAllowedError') setErrorMsg('Camera permission denied. Please allow camera access in your browser settings and try again.')
-      else if (e.name === 'NotFoundError') setErrorMsg('No camera found on this device.')
-      else if (e.name === 'NotReadableError') setErrorMsg('Camera is in use by another application.')
-      else setErrorMsg(e.message || 'Failed to start camera.')
-
-      setCameraState('error')
-      onCameraReadyRef.current(null, null)
-    }
-  }, [modelsReady, startFaceDetection])
-
-  /* ---------------------------------------------------------------- */
-  /*  stopCamera – full teardown                                       */
-  /* ---------------------------------------------------------------- */
-  const stopCamera = useCallback(() => {
-    console.log('[CameraPreview] Stopping camera')
-    startingRef.current = false
-
-    if (detectionRef.current) {
-      clearInterval(detectionRef.current)
-      detectionRef.current = null
-    }
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop())
-      streamRef.current = null
-    }
-    const video = videoRef.current
-    if (video) video.srcObject = null
-
-    setCameraState('idle')
-    setErrorMsg('')
-    onCameraReadyRef.current(null, null)
-    onFaceDetectedRef.current(false, 0)
-  }, [])
-
-  /* ---------------------------------------------------------------- */
-  /*  Auto-start / auto-stop effect                                    */
-  /* ---------------------------------------------------------------- */
-  useEffect(() => {
-    if (isActive && cameraState === 'idle' && modelsReady && !startingRef.current) {
-      console.log('[CameraPreview] Auto-starting camera')
-      startCamera()
-    }
-
-    if (!isActive && (cameraState === 'ready' || cameraState === 'starting')) {
-      console.log('[CameraPreview] Deactivating – stopping camera')
-      stopCamera()
-    }
-  }, [isActive, cameraState, modelsReady, startCamera, stopCamera])
-
-  /* ---------------------------------------------------------------- */
-  /*  Cleanup on unmount – stop stream (but do NOT reset startingRef)  */
-  /* ---------------------------------------------------------------- */
-  useEffect(() => {
-    return () => {
-      if (detectionRef.current) clearInterval(detectionRef.current)
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop())
-        streamRef.current = null
-      }
-    }
-  }, [])
-
-  /* ---- Manual retry handler ---- */
-  const handleRetry = useCallback(() => {
-    setErrorMsg('')
-    setCameraState('idle')
-    startingRef.current = false
-    // Defer startCamera to next tick so state settles
-    setTimeout(() => startCamera(), 50)
-  }, [startCamera])
-
-  return (
-    <div className="space-y-4">
-      {/* Camera preview container */}
-      <div className="relative rounded-2xl overflow-hidden bg-secondary aspect-video">
-        {/* Video element – ALWAYS in DOM, ALWAYS rendered */}
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          className="w-full h-full object-cover"
-          style={{ transform: 'scaleX(-1)' }}
-        />
-
-        {/* Loading overlay */}
-        {cameraState === 'starting' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
-            <Loader2 className="w-10 h-10 text-primary animate-spin" />
-            <span className="text-sm text-muted-foreground">Initializing camera...</span>
-          </div>
-        )}
-
-        {/* Error overlay */}
-        {cameraState === 'error' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
-            <AlertCircle className="w-10 h-10 text-red-400" />
-            <span className="text-sm text-red-400 text-center px-6">{errorMsg}</span>
-            <button onClick={handleRetry} className="btn-primary text-sm px-4 py-2">
-              Retry <Camera className="w-4 h-4 ml-1" />
-            </button>
-          </div>
-        )}
-
-        {/* Idle overlay */}
-        {cameraState === 'idle' && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
-            <Camera className="w-12 h-12 text-muted-foreground" />
-            <span className="text-sm text-muted-foreground">Camera is off</span>
-          </div>
-        )}
-
-        {/* Active indicator */}
-        {cameraState === 'ready' && (
-          <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium z-20">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            Camera active
-          </div>
-        )}
-
-        {/* Detection overlay */}
-        {cameraState === 'ready' && overlay}
-      </div>
-
-      {/* Action buttons */}
-      <div className="flex gap-3">
-        {cameraState === 'idle' && isActive && (
-          <button
-            onClick={startCamera}
-            disabled={!modelsReady}
-            className="w-full btn-primary disabled:opacity-50"
-          >
-            <Camera className="w-5 h-5 mr-2" /> Open Camera
-          </button>
-        )}
-
-        {cameraState === 'ready' && primaryButton && (
-          <button
-            onClick={primaryButton.onClick}
-            disabled={primaryButton.disabled}
-            className="w-full btn-primary disabled:opacity-50"
-          >
-            {primaryButton.label}
-          </button>
-        )}
-
-        {cameraState === 'ready' && secondaryButton && (
-          <button onClick={secondaryButton.onClick} className="w-full btn-secondary">
-            {secondaryButton.label}
-          </button>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/* ------------------------------------------------------------------ */
 /*  Page Component                                                     */
 /* ------------------------------------------------------------------ */
 
 export default function EnrollPage() {
   const router = useRouter()
+
+  // Step flow
   const [currentStep, setCurrentStep] = useState(0)
-  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null)
-  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null)
-  const [cameraReady, setCameraReady] = useState(false)
-  const [faceDetected, setFaceDetected] = useState(false)
-  const [captureCount, setCaptureCount] = useState(0)
-  const [processing, setProcessing] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState(false)
-  const [confidence, setConfidence] = useState(0)
+
+  // Camera state
+  const [cameraStatus, setCameraStatus] = useState<'off' | 'starting' | 'active' | 'error'>('off')
+  const [cameraError, setCameraError] = useState('')
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const detectionRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Face detection
   const [modelsReady, setModelsReady] = useState(false)
-  const [modelsError, setModelsError] = useState(false)
+  const [faceDetected, setFaceDetected] = useState(false)
+  const [confidence, setConfidence] = useState(0)
+  const [captureCount, setCaptureCount] = useState(0)
+  const [processing, setProcessing] = useState(false)
 
   const captureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  /* Load face-api models on mount */
+  /* ---- Load face-api models ---- */
   useEffect(() => {
-    const loadModels = async () => {
+    let cancelled = false
+    const load = async () => {
       try {
         console.log('[Enroll] Loading models from', MODEL_URL)
         await Promise.all([
@@ -431,44 +59,165 @@ export default function EnrollPage() {
           faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
           faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
         ])
-        setModelsReady(true)
-        console.log('[Enroll] Models loaded successfully')
+        if (!cancelled) {
+          setModelsReady(true)
+          console.log('[Enroll] Models loaded successfully')
+        }
       } catch (err) {
         console.error('[Enroll] Model load failed:', err)
-        setModelsError(true)
-        setError('Failed to load face detection models. Please refresh the page.')
+        if (!cancelled) setError('Failed to load face detection models. Please refresh.')
       }
     }
-    loadModels()
+    load()
+    return () => { cancelled = true }
+  }, [])
 
+  /* ---- Cleanup on unmount ---- */
+  useEffect(() => {
     return () => {
+      if (detectionRef.current) clearInterval(detectionRef.current)
       if (captureTimerRef.current) clearTimeout(captureTimerRef.current)
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop())
+      }
     }
   }, [])
 
-  /* Handle camera ready state from CameraPreview */
-  const handleCameraReady = useCallback((video: HTMLVideoElement | null, stream: MediaStream | null) => {
-    console.log('[Enroll] Camera ready:', !!video, !!stream)
-    setVideoEl(video)
-    setCameraStream(stream)
-    setCameraReady(!!video && !!stream)
+  /* ================================================================ */
+  /*  CAMERA LIFECYCLE                                                */
+  /*  Everything is driven by direct calls, NOT by useEffect.         */
+  /*  The user clicks a button → we call startCamera().               */
+  /*  This avoids ALL React StrictMode useEffect timing issues.       */
+  /* ================================================================ */
+
+  const stopCamera = useCallback(() => {
+    console.log('[Enroll] stopCamera')
+    if (detectionRef.current) { clearInterval(detectionRef.current); detectionRef.current = null }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop())
+      streamRef.current = null
+    }
+    if (videoRef.current) videoRef.current.srcObject = null
+    setCameraStatus('off')
+    setCameraError('')
+    setFaceDetected(false)
+    setConfidence(0)
   }, [])
 
-  /* Handle face detection updates from CameraPreview */
-  const handleFaceDetected = useCallback((detected: boolean, score: number) => {
-    setFaceDetected(detected)
-    setConfidence(score)
+  /** Called directly from a button click – runs in USER GESTURE context */
+  const startCamera = useCallback(async () => {
+    if (cameraStatus === 'starting' || cameraStatus === 'active') return
+
+    console.log('[Enroll] startCamera — requesting getUserMedia')
+    setCameraStatus('starting')
+    setCameraError('')
+    setError('')
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+        audio: false,
+      })
+
+      if (stream.getVideoTracks().length === 0) {
+        stream.getTracks().forEach(t => t.stop())
+        throw new Error('No video tracks found.')
+      }
+
+      streamRef.current = stream
+      console.log('[Enroll] Stream obtained:', stream.id)
+
+      // We are STILL in the click-handler's microtask, so the video
+      // element from step 2 might not be in the DOM yet.
+      // We wait a tick for React to render step 2, then attach.
+      // But actually — if we're already on step 2, the element exists.
+      // If we're transitioning from step 1 → 2, React needs to render first.
+
+      // Give React a chance to render (if step was just changed)
+      await new Promise(r => setTimeout(r, 50))
+
+      const video = videoRef.current
+      if (!video) {
+        console.error('[Enroll] Video element not found after waiting')
+        stream.getTracks().forEach(t => t.stop())
+        streamRef.current = null
+        setCameraStatus('error')
+        setCameraError('Video element not found. Please refresh the page.')
+        return
+      }
+
+      console.log('[Enroll] Attaching stream to video element')
+      video.srcObject = stream
+      video.muted = true
+
+      // Explicitly play — this works because we're still in user-gesture
+      // context (or very close to it), and the video is muted.
+      try {
+        await video.play()
+        console.log('[Enroll] video.play() succeeded')
+      } catch (playErr) {
+        console.warn('[Enroll] video.play() rejected:', playErr, 'retrying...')
+        await new Promise(r => setTimeout(r, 200))
+        try {
+          await video.play()
+          console.log('[Enroll] video.play() retry succeeded')
+        } catch (retryErr) {
+          console.error('[Enroll] video.play() retry also failed:', retryErr)
+          // Even if play failed, autoplay attribute may still kick in.
+          // Don't throw — just log and continue.
+        }
+      }
+
+      console.log('[Enroll] Camera active! videoWidth:', video.videoWidth, 'videoHeight:', video.videoHeight)
+      setCameraStatus('active')
+      startFaceDetection()
+    } catch (err: unknown) {
+      console.error('[Enroll] startCamera error:', err)
+      const e = err as Error
+      if (e.name === 'NotAllowedError') setCameraError('Camera permission denied. Please allow camera access in your browser settings.')
+      else if (e.name === 'NotFoundError') setCameraError('No camera found on this device.')
+      else if (e.name === 'NotReadableError') setCameraError('Camera is in use by another app.')
+      else setCameraError(e.message || 'Failed to start camera.')
+      setCameraStatus('error')
+    }
+  }, [cameraStatus]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ---- Face detection loop ---- */
+  const startFaceDetection = useCallback(() => {
+    if (detectionRef.current) { clearInterval(detectionRef.current); detectionRef.current = null }
+
+    console.log('[Enroll] Starting face detection loop')
+    detectionRef.current = setInterval(async () => {
+      const video = videoRef.current
+      if (!video || video.readyState < 2) return
+      try {
+        const det = await faceapi.detectSingleFace(video)
+        setFaceDetected(!!det)
+        setConfidence(det?.score ?? 0)
+      } catch {
+        setFaceDetected(false)
+      }
+    }, 500)
   }, [])
 
-  /* Process enrollment with the final captured image */
+  /* ---- "Allow Camera" button on Step 1 ---- */
+  const handleAllowCamera = useCallback(() => {
+    // 1. Move to step 2 (renders the video element)
+    setCurrentStep(2)
+    // 2. Start the camera immediately — we're in a click handler,
+    //    so getUserMedia has user-gesture context.
+    //    We set cameraStatus first, then startCamera picks up after render.
+    // Use setTimeout(0) so React can commit step 2 render first.
+    setTimeout(() => startCamera(), 0)
+  }, [startCamera])
+
+  /* ---- Capture ---- */
   const processEnrollment = useCallback(async (finalImage: string) => {
     setProcessing(true)
     setError('')
     try {
-      console.log('[Enroll] Processing enrollment...')
       const img = await faceapi.fetchImage(finalImage)
       const det = await faceapi.detectSingleFace(img).withFaceLandmarks().withFaceDescriptor()
-
       if (!det) {
         setError('Could not detect face. Try again with better lighting.')
         setProcessing(false)
@@ -476,90 +225,53 @@ export default function EnrollPage() {
         setCaptureCount(0)
         return
       }
-
       const embedding = Array.from(det.descriptor)
       const userId = sessionStorage.getItem('signupUserId') || sessionStorage.getItem('userId') || ''
       const username = sessionStorage.getItem('signupUsername') || sessionStorage.getItem('user') || ''
-
       const res = await fetch('/api/enroll-face', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, username, embedding, imageData: finalImage }),
       })
       const data = await res.json()
-
-      if (data.success) {
-        setSuccess(true)
-        setCurrentStep(5)
-      } else {
-        setError(data.message || 'Enrollment failed.')
-        setCurrentStep(2)
-        setCaptureCount(0)
-      }
-    } catch (err) {
-      console.error('[Enroll] Enrollment error:', err)
-      setError('Failed to process enrollment.')
-      setCurrentStep(2)
-      setCaptureCount(0)
+      if (data.success) { setSuccess(true); setCurrentStep(5) }
+      else { setError(data.message || 'Enrollment failed.'); setCurrentStep(2); setCaptureCount(0) }
+    } catch {
+      setError('Failed to process enrollment.'); setCurrentStep(2); setCaptureCount(0)
     } finally {
       setProcessing(false)
     }
   }, [])
 
-  /* Capture a single face sample */
   const captureSample = useCallback(async () => {
-    if (!videoEl || videoEl.readyState < 2) {
-      setError('Camera preview not ready.')
-      return
-    }
-
+    const video = videoRef.current
+    if (!video || video.readyState < 2) { setError('Camera not ready.'); return }
     try {
       const canvas = document.createElement('canvas')
-      canvas.width = videoEl.videoWidth
-      canvas.height = videoEl.videoHeight
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-
-      ctx.translate(canvas.width, 0)
-      ctx.scale(-1, 1)
-      ctx.drawImage(videoEl, 0, 0)
-
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      const ctx = canvas.getContext('2d')!
+      ctx.translate(canvas.width, 0); ctx.scale(-1, 1)
+      ctx.drawImage(video, 0, 0)
       const imageData = canvas.toDataURL('image/jpeg', 0.85)
-      const newCount = captureCount + 1
-      setCaptureCount(newCount)
-      console.log('[Enroll] Sample', newCount, '/ 5 captured')
-
-      if (newCount >= 5) {
-        setCurrentStep(4)
-        await processEnrollment(imageData)
-      }
-    } catch (err) {
-      console.error('[Enroll] Capture error:', err)
-      setError('Failed to capture face sample.')
-    }
-  }, [videoEl, captureCount, processEnrollment])
+      const n = captureCount + 1
+      setCaptureCount(n)
+      if (n >= 5) { setCurrentStep(4); await processEnrollment(imageData) }
+    } catch { setError('Failed to capture.') }
+  }, [captureCount, processEnrollment])
 
   /* Auto-capture on step 3 */
   useEffect(() => {
-    if (captureTimerRef.current) {
-      clearTimeout(captureTimerRef.current)
-      captureTimerRef.current = null
-    }
-
-    if (currentStep === 3 && cameraReady && faceDetected && !processing) {
-      console.log('[Enroll] Auto-capturing in 1.5s...')
+    if (captureTimerRef.current) { clearTimeout(captureTimerRef.current); captureTimerRef.current = null }
+    if (currentStep === 3 && cameraStatus === 'active' && faceDetected && !processing) {
       captureTimerRef.current = setTimeout(() => captureSample(), 1500)
     }
+    return () => { if (captureTimerRef.current) { clearTimeout(captureTimerRef.current); captureTimerRef.current = null } }
+  }, [currentStep, cameraStatus, faceDetected, processing, captureSample])
 
-    return () => {
-      if (captureTimerRef.current) {
-        clearTimeout(captureTimerRef.current)
-        captureTimerRef.current = null
-      }
-    }
-  }, [currentStep, cameraReady, faceDetected, processing, captureSample])
-
-  /* ---- Step renderer ---- */
+  /* ================================================================ */
+  /*  RENDER                                                          */
+  /* ================================================================ */
   const step = STEPS[currentStep]
 
   return (
@@ -575,6 +287,7 @@ export default function EnrollPage() {
             <span className="text-xl font-bold text-gradient">Za-Biometrie</span>
           </Link>
         </div>
+
         <div className="glass rounded-2xl p-8 shadow-glow">
           <div className="space-y-8">
             {/* Step indicator */}
@@ -664,25 +377,75 @@ export default function EnrollPage() {
                     <ArrowLeft className="w-4 h-4 mr-2" /> Back
                   </button>
                   <button
-                    onClick={() => setCurrentStep(2)}
+                    onClick={handleAllowCamera}
                     disabled={!modelsReady}
                     className="btn-primary flex-1 disabled:opacity-50"
                   >
-                    {modelsReady ? 'Allow Camera' : 'Loading Models...'} <ArrowRight className="w-5 h-5 ml-2" />
+                    {modelsReady ? (
+                      <><Camera className="w-5 h-5 mr-2" /> Allow Camera</>
+                    ) : (
+                      <><Loader2 className="w-5 h-5 mr-2 animate-spin" /> Loading Models...</>
+                    )}
                   </button>
                 </div>
               </div>
             )}
 
-            {/* ======== Steps 2 & 3: Camera ======== */}
+            {/* ======== Steps 2 & 3: Camera + Preview ======== */}
             {(currentStep === 2 || currentStep === 3) && (
               <div className="space-y-6">
-                <CameraPreview
-                  isActive={true}
-                  modelsReady={modelsReady}
-                  onCameraReady={handleCameraReady}
-                  onFaceDetected={handleFaceDetected}
-                  overlay={
+                {/* ---- Video container ---- */}
+                <div className="relative rounded-2xl overflow-hidden bg-secondary aspect-video">
+                  {/* The video element */}
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover"
+                    style={{ transform: 'scaleX(-1)' }}
+                  />
+
+                  {/* Starting overlay */}
+                  {cameraStatus === 'starting' && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
+                      <Loader2 className="w-10 h-10 text-primary animate-spin" />
+                      <span className="text-sm text-muted-foreground">Initializing camera...</span>
+                    </div>
+                  )}
+
+                  {/* Error overlay */}
+                  {cameraStatus === 'error' && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
+                      <AlertCircle className="w-10 h-10 text-red-400" />
+                      <span className="text-sm text-red-400 text-center px-6">{cameraError}</span>
+                      <button onClick={startCamera} className="btn-primary text-sm px-4 py-2">
+                        Retry <Camera className="w-4 h-4 ml-1" />
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Off overlay */}
+                  {cameraStatus === 'off' && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-secondary/90 backdrop-blur-sm z-10">
+                      <Camera className="w-12 h-12 text-muted-foreground" />
+                      <span className="text-sm text-muted-foreground">Camera is off</span>
+                      <button onClick={startCamera} disabled={!modelsReady} className="btn-primary text-sm px-4 py-2 disabled:opacity-50">
+                        <Camera className="w-4 h-4 mr-1" /> Open Camera
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Active badge */}
+                  {cameraStatus === 'active' && (
+                    <div className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-emerald-400 text-xs font-medium z-20">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                      Camera active
+                    </div>
+                  )}
+
+                  {/* Face overlay (active only) */}
+                  {cameraStatus === 'active' && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
                       <div className={`w-48 h-60 border-2 rounded-full transition-all mb-16 ${
                         faceDetected ? 'border-emerald-500/70' : 'border-white/30 animate-pulse'
@@ -705,28 +468,38 @@ export default function EnrollPage() {
                         )}
                       </div>
                     </div>
-                  }
-                  primaryButton={currentStep === 2 ? {
-                    label: 'Continue to Capture',
-                    onClick: () => {
-                      if (faceDetected) {
-                        setCurrentStep(3)
-                        setCaptureCount(0)
-                        setFaceDetected(false)
-                        setConfidence(0)
-                      } else {
-                        setError('Please position your face in the frame first.')
-                      }
-                    },
-                    disabled: !faceDetected,
-                  } : undefined}
-                  secondaryButton={currentStep === 2 ? {
-                    label: 'Close Camera',
-                    onClick: () => setCurrentStep(1),
-                  } : undefined}
-                />
+                  )}
+                </div>
 
-                {currentStep === 2 && cameraReady && (
+                {/* ---- Action buttons ---- */}
+                <div className="flex gap-3">
+                  {currentStep === 2 && cameraStatus === 'active' && (
+                    <>
+                      <button
+                        onClick={() => {
+                          if (faceDetected) {
+                            setCaptureCount(0)
+                            setFaceDetected(false)
+                            setConfidence(0)
+                            setCurrentStep(3)
+                          } else {
+                            setError('Please position your face in the frame first.')
+                          }
+                        }}
+                        disabled={!faceDetected}
+                        className="w-full btn-primary disabled:opacity-50"
+                      >
+                        Continue to Capture
+                      </button>
+                      <button onClick={() => { stopCamera(); setCurrentStep(1) }} className="w-full btn-secondary">
+                        Close Camera
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {/* Step 2 instructions */}
+                {currentStep === 2 && cameraStatus === 'active' && (
                   <div className="glass rounded-xl p-6">
                     <h3 className="text-lg font-semibold text-foreground mb-3">Position your face</h3>
                     <ul className="space-y-2 text-sm text-muted-foreground">
@@ -737,7 +510,8 @@ export default function EnrollPage() {
                   </div>
                 )}
 
-                {currentStep === 3 && cameraReady && (
+                {/* Step 3 progress */}
+                {currentStep === 3 && cameraStatus === 'active' && (
                   <>
                     <div className="space-y-2">
                       <div className="flex justify-between items-center">
@@ -745,10 +519,7 @@ export default function EnrollPage() {
                         <span className="text-sm text-muted-foreground">{captureCount}/5</span>
                       </div>
                       <div className="w-full bg-secondary rounded-full h-2 overflow-hidden">
-                        <div
-                          className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
-                          style={{ width: `${(captureCount / 5) * 100}%` }}
-                        />
+                        <div className="h-full bg-primary rounded-full transition-all duration-500 ease-out" style={{ width: `${(captureCount / 5) * 100}%` }} />
                       </div>
                     </div>
                     <div className="glass rounded-xl p-4">
